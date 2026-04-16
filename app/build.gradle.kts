@@ -4,15 +4,15 @@ plugins {
 }
 
 android {
-    namespace = "tn.loukious.facebookapp"
+    namespace = "tn.loukious.facebookappadsremover"
     compileSdk = 35
 
     defaultConfig {
         applicationId = "tn.loukious.facebookappadsremover"
         minSdk = 33
         targetSdk = 35
-        versionCode = 1
-        versionName = "1.0"
+        versionCode = 2
+        versionName = "1.1"
 
         testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"
     }
@@ -37,6 +37,8 @@ android {
         buildConfig = true
     }
 }
+
+base.archivesName.set("FacebookAppAdsRemover-v${android.defaultConfig.versionName}")
 
 dependencies {
     compileOnly("com.github.deltazefiro:XposedBridge:main-SNAPSHOT")

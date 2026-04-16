@@ -1,4 +1,4 @@
-package tn.loukious.facebookapp;
+package tn.loukious.facebookappadsremover;
 
 import android.util.Log;
 
