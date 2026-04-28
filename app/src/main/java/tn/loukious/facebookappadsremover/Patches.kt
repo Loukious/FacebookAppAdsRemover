@@ -26,7 +26,12 @@ const val TAG = "FacebookAppAdsRemover"
 
 private const val HOST_PACKAGE = "com.facebook.katana"
 private const val BEFORE_SIZE_EXTRA = "facebook_ads_before_size"
-private const val BUILD_MARKER = "feed_story_feedcsr_banner_v21_2026_04_16"
+private const val BUILD_MARKER = "feed_story_feedcsr_banner_v31_2026_04_28"
+private const val ENABLE_UPSTREAM_REELS_AD_HOOKS = true
+private const val ENABLE_FEED_CSR_FILTER_HOOKS = true
+private const val ENABLE_LATE_FEED_LIST_HOOKS = true
+private const val ENABLE_STORY_POOL_ADD_HOOKS = true
+private const val ENABLE_FEED_SPONSORED_POOL_HOOKS = true
 private const val GRAPHQL_FEED_UNIT_EDGE_CLASS = "com.facebook.graphql.model.GraphQLFeedUnitEdge"
 private const val GRAPHQL_MULTI_ADS_FEED_UNIT_CLASS = "com.facebook.graphql.model.GraphQLFBMultiAdsFeedUnit"
 private const val GRAPHQL_QUICK_PROMO_FEED_UNIT_CLASS =
@@ -77,6 +82,11 @@ private val FEED_AD_CATEGORY_VALUES = setOf(
     "BANNER"
 )
 
+private val FEED_SAFE_CONTAINER_CATEGORY_VALUES = setOf(
+    "FB_SHORTS",
+    "MULTI_FB_STORIES_TRAY"
+)
+
 private val FEED_AD_SIGNAL_TOKENS = listOf(
     "sponsored",
     "promotion",
@@ -94,6 +104,20 @@ private val FEED_AD_SIGNAL_TOKENS = listOf(
     "floatingcta"
 )
 
+private val REELS_AD_SIGNAL_TOKENS = listOf(
+    "sponsored",
+    "promotion",
+    "multiads",
+    "quickpromotion",
+    "reels_banner_ad",
+    "reelsbannerads",
+    "adbreakdeferredcta",
+    "instreamadidlewithbannerstate",
+    "instream_legacy_banner_ad",
+    "unified_player_banner_ad",
+    "banner_ad_"
+)
+
 private object Log {
     fun i(tag: String, msg: String): Int = if (BuildConfig.DEBUG) AndroidLog.i(tag, msg) else 0
 
@@ -106,6 +130,17 @@ private object Log {
 
     fun e(tag: String, msg: String, throwable: Throwable): Int =
         if (BuildConfig.DEBUG) AndroidLog.e(tag, msg, throwable) else 0
+
+    fun missing(tag: String, hookName: String): Int =
+        AndroidLog.w(tag, "Hook target not found: $hookName")
+
+    fun resolutionFailure(tag: String, msg: String, throwable: Throwable): Int {
+        return if (BuildConfig.DEBUG || throwable.message?.contains("Unable to resolve") == true) {
+            AndroidLog.e(tag, msg, throwable)
+        } else {
+            0
+        }
+    }
 }
 
 private data class FeedListSanitizerHook(
@@ -128,6 +163,7 @@ private data class ResolvedHooks(
     val pluginPackBuildMethod: Method?,
     val instreamBannerEligibilityMethod: Method?,
     val indicatorPillAdEligibilityMethod: Method?,
+    val reelsBannerRenderMethods: List<Method>,
     val feedCsrFilterMethods: List<Method>,
     val lateFeedListHooks: List<FeedListSanitizerHook>,
     val storyPoolAddMethods: List<Method>,
@@ -152,6 +188,15 @@ private class AdStoryInspector(
         depth: Int = 0,
         seen: IdentityHashMap<Any, Boolean> = IdentityHashMap()
     ): Boolean {
+        return containsAdKind(value, depth, seen) &&
+            containsReelsAdSignal(value, 0, IdentityHashMap())
+    }
+
+    private fun containsAdKind(
+        value: Any?,
+        depth: Int = 0,
+        seen: IdentityHashMap<Any, Boolean> = IdentityHashMap()
+    ): Boolean {
         if (value == null || depth > 4) return false
         if (isAdKind(value)) return true
 
@@ -164,7 +209,7 @@ private class AdStoryInspector(
         if (value is Iterable<*>) {
             var checked = 0
             for (item in value) {
-                if (containsAdStory(item, depth + 1, seen)) return true
+                if (containsAdKind(item, depth + 1, seen)) return true
                 checked++
                 if (checked >= 8) break
             }
@@ -175,7 +220,7 @@ private class AdStoryInspector(
             if (array != null) {
                 var checked = 0
                 for (item in array) {
-                    if (containsAdStory(item, depth + 1, seen)) return true
+                    if (containsAdKind(item, depth + 1, seen)) return true
                     checked++
                     if (checked >= 8) break
                 }
@@ -189,7 +234,67 @@ private class AdStoryInspector(
 
         for (field in fieldsFor(type)) {
             val fieldValue = runCatching { field.get(value) }.getOrNull()
-            if (containsAdStory(fieldValue, depth + 1, seen)) return true
+            if (containsAdKind(fieldValue, depth + 1, seen)) return true
+        }
+
+        return false
+    }
+
+    private fun containsReelsAdSignal(
+        value: Any?,
+        depth: Int,
+        seen: IdentityHashMap<Any, Boolean>
+    ): Boolean {
+        if (value == null || depth > 4) return false
+
+        if (value is CharSequence) {
+            return isReelsAdSignalText(value.toString())
+        }
+
+        val type = value.javaClass
+        if (isReelsAdSignalText(type.name)) return true
+
+        if (type.isEnum) {
+            return isReelsAdSignalText(value.toString())
+        }
+
+        if (type.isPrimitive || value is Number || value is Boolean) {
+            return false
+        }
+
+        if (seen.put(value, true) != null) return false
+
+        if (value is Iterable<*>) {
+            var checked = 0
+            for (item in value) {
+                if (containsReelsAdSignal(item, depth + 1, seen)) return true
+                checked++
+                if (checked >= 8) break
+            }
+        }
+
+        if (type.isArray) {
+            val array = value as? Array<*>
+            if (array != null) {
+                var checked = 0
+                for (item in array) {
+                    if (containsReelsAdSignal(item, depth + 1, seen)) return true
+                    checked++
+                    if (checked >= 8) break
+                }
+            }
+        }
+
+        if (isReelsAdSignalText(runCatching { value.toString() }.getOrNull())) return true
+
+        for (method in stringMethodsFor(type)) {
+            val marker = runCatching { method.invoke(value) as? String }.getOrNull()
+            if (isReelsAdSignalText(marker)) return true
+        }
+
+        for (field in fieldsFor(type)) {
+            val fieldValue = runCatching { field.get(value) }.getOrNull()
+            if (containsReelsAdSignal(fieldValue, depth + 1, seen)) return true
         }
 
         return false
@@ -235,6 +340,40 @@ private class AdStoryInspector(
             fields
         }
     }
+
+    private fun stringMethodsFor(type: Class<*>): List<Method> {
+        return allMethodsFor(type)
+            .asSequence()
+            .filter { method ->
+                method.parameterCount == 0 &&
+                    method.returnType == String::class.java &&
+                    method.name != "toString"
+            }
+            .take(12)
+            .onEach { method -> method.isAccessible = true }
+            .toList()
+    }
+
+    private fun allMethodsFor(type: Class<*>): List<Method> {
+        val methods = LinkedHashMap<String, Method>()
+        var current: Class<*>? = type
+        while (current != null && current != Any::class.java) {
+            current.declaredMethods.forEach { method ->
+                if (!Modifier.isStatic(method.modifiers)) {
+                    method.isAccessible = true
+                    methods.putIfAbsent("${current.name}#${method.name}/${method.parameterCount}", method)
+                }
+            }
+            current = current.superclass
+        }
+        return methods.values.toList()
+    }
+
+    private fun isReelsAdSignalText(value: String?): Boolean {
+        if (value.isNullOrBlank()) return false
+        val normalized = value.lowercase()
+        return REELS_AD_SIGNAL_TOKENS.any { token -> normalized.contains(token) }
+    }
 }
 
 private class FeedItemInspector(
@@ -243,23 +382,48 @@ private class FeedItemInspector(
     private val itemModelAccessor = resolveItemModelAccessor(itemContractTypes)
     private val itemEdgeAccessor = resolveItemEdgeAccessor(itemContractTypes)
     private val itemNetworkAccessor = resolveItemNetworkAccessor(itemContractTypes)
-    private val categoryMethodCache = ConcurrentHashMap<Class<*>, Method?>()
-    private val edgeAccessorCache = ConcurrentHashMap<Class<*>, Method?>()
-    private val feedUnitAccessorCache = ConcurrentHashMap<Class<*>, Method?>()
-    private val typeNameMethodCache = ConcurrentHashMap<Class<*>, Method?>()
+    private val categoryMethodCache = ConcurrentHashMap<Class<*>, Method>()
+    private val edgeAccessorCache = ConcurrentHashMap<Class<*>, Method>()
+    private val feedUnitAccessorCache = ConcurrentHashMap<Class<*>, Method>()
+    private val typeNameMethodCache = ConcurrentHashMap<Class<*>, Method>()
     private val stringAccessorCache = ConcurrentHashMap<Class<*>, List<Method>>()
     private val stringFieldCache = ConcurrentHashMap<Class<*>, List<Field>>()
 
     fun isSponsoredFeedItem(value: Any?): Boolean {
+        if (isDefinitelySponsoredFeedItem(value)) {
+            return true
+        }
+
+        val model = invokeNoThrow(itemModelAccessor, value)
+        val edge = edgeFrom(value)
+        val feedUnit = feedUnitFrom(edge)
+
+        if (containsKnownAdSignals(value)) return true
+        if (containsKnownAdSignals(model)) return true
+        if (containsKnownAdSignals(edge)) return true
+        if (containsKnownAdSignals(feedUnit)) return true
+
+        return false
+    }
+
+    fun isDefinitelySponsoredFeedItem(value: Any?): Boolean {
         if (value == null) return false
 
         val model = invokeNoThrow(itemModelAccessor, value)
-        if (isSponsoredFeedCategory(readCategory(model))) {
+        val modelCategory = readCategory(model)
+        if (isSafeFeedContainerCategory(modelCategory)) {
+            return false
+        }
+        if (isSponsoredFeedCategory(modelCategory)) {
             return true
         }
 
         val edge = edgeFrom(value)
-        if (isSponsoredFeedCategory(readCategory(edge))) {
+        val edgeCategory = readCategory(edge)
+        if (isSafeFeedContainerCategory(edgeCategory)) {
+            return false
+        }
+        if (isSponsoredFeedCategory(edgeCategory)) {
             return true
         }
 
@@ -273,11 +437,6 @@ private class FeedItemInspector(
         if (isLikelyAdTypeName(typeName) || isAdSignalText(unitClassName)) {
             return true
         }
-
-        if (containsKnownAdSignals(value)) return true
-        if (containsKnownAdSignals(model)) return true
-        if (containsKnownAdSignals(edge)) return true
-        if (containsKnownAdSignals(feedUnit)) return true
 
         return false
     }
@@ -307,7 +466,7 @@ private class FeedItemInspector(
             }
         }
 
-        val fallback = edgeAccessorCache.getOrPut(value.javaClass) {
+        val fallback = cachedMethod(edgeAccessorCache, value.javaClass) {
             resolveChildAccessor(value) { candidateValue ->
                 candidateValue != null && candidateValue.javaClass.name == GRAPHQL_FEED_UNIT_EDGE_CLASS
             }
@@ -318,7 +477,7 @@ private class FeedItemInspector(
     private fun feedUnitFrom(edge: Any?): Any? {
         if (edge == null) return null
 
-        val accessor = feedUnitAccessorCache.getOrPut(edge.javaClass) {
+        val accessor = cachedMethod(feedUnitAccessorCache, edge.javaClass) {
             resolveChildAccessor(edge) { candidateValue ->
                 val className = candidateValue?.javaClass?.name
                 className == GRAPHQL_MULTI_ADS_FEED_UNIT_CLASS ||
@@ -336,7 +495,7 @@ private class FeedItemInspector(
             return value.toString()
         }
 
-        val accessor = categoryMethodCache.getOrPut(value.javaClass) {
+        val accessor = cachedMethod(categoryMethodCache, value.javaClass) {
             allInstanceMethods(value.javaClass).firstOrNull { candidate ->
                 candidate.parameterCount == 0 &&
                     candidate.returnType.isEnum &&
@@ -352,7 +511,7 @@ private class FeedItemInspector(
     private fun readTypeName(value: Any?): String? {
         if (value == null) return null
 
-        val accessor = typeNameMethodCache.getOrPut(value.javaClass) {
+        val accessor = cachedMethod(typeNameMethodCache, value.javaClass) {
             allInstanceMethods(value.javaClass).firstOrNull { candidate ->
                 candidate.parameterCount == 0 &&
                     candidate.returnType == String::class.java &&
@@ -360,6 +519,16 @@ private class FeedItemInspector(
             }?.apply { isAccessible = true }
         }
         return invokeNoThrow(accessor, value) as? String
+    }
+
+    private fun cachedMethod(
+        cache: ConcurrentHashMap<Class<*>, Method>,
+        type: Class<*>,
+        resolver: () -> Method?
+    ): Method? {
+        cache[type]?.let { return it }
+        val resolved = resolver() ?: return null
+        return cache.putIfAbsent(type, resolved) ?: resolved
     }
 
     private fun resolveItemModelAccessor(itemContractTypes: Collection<Class<*>>): Method? {
@@ -427,6 +596,10 @@ private class FeedItemInspector(
 
     private fun isSponsoredFeedCategory(value: String?): Boolean {
         return value != null && value in FEED_AD_CATEGORY_VALUES
+    }
+
+    private fun isSafeFeedContainerCategory(value: String?): Boolean {
+        return value != null && value in FEED_SAFE_CONTAINER_CATEGORY_VALUES
     }
 
     private fun isLikelyAdTypeName(value: String?): Boolean {
@@ -574,38 +747,78 @@ fun installFacebookAdRemover(classLoader: ClassLoader, bridge: DexKitBridge) {
     try {
         Log.i(TAG, "Starting hook install: $BUILD_MARKER")
         val hooks = resolveHooks(classLoader, bridge)
-        val inspector = AdStoryInspector(hooks.adKindEnumClass)
         val feedItemInspector = FeedItemInspector(hooks.storyPoolAddMethods.map { it.parameterTypes[0] })
 
-        hookListBuilderAppend(hooks.listBuilderAppendMethod, inspector)
-        hooks.listBuilderFactoryMethod?.let { hookListResultFilter(it, "list factory", inspector) }
-        hooks.pluginPackBuildMethod?.let { hookPluginPackFallback(it, inspector) }
+        if (ENABLE_UPSTREAM_REELS_AD_HOOKS) {
+            val inspector = AdStoryInspector(hooks.adKindEnumClass)
+            hookListBuilderAppend(hooks.listBuilderAppendMethod, inspector)
+            hooks.listBuilderFactoryMethod?.let { hookListResultFilter(it, "list factory", inspector) }
+            hooks.pluginPackBuildMethod?.let { hookPluginPackFallback(it, inspector) }
+        } else {
+            Log.i(TAG, "Skipped upstream Reels list/plugin hooks to preserve feed Reels carousels")
+        }
         hooks.instreamBannerEligibilityMethod?.let { hookInstreamBannerEligibility(it) }
         hooks.indicatorPillAdEligibilityMethod?.let { hookIndicatorPillAdEligibility(it) }
-        hooks.feedCsrFilterMethods.forEach { method ->
-            runCatching { hookFeedCsrFilterInput(method, feedItemInspector) }
-                .onFailure { Log.e(TAG, "Failed to hook feed CSR filter ${method.declaringClass.name}.${method.name}", it) }
-        }
-        hooks.lateFeedListHooks.forEach { hook ->
-            runCatching { hookLateFeedListSanitizer(hook, feedItemInspector) }
+        hooks.reelsBannerRenderMethods.forEach { method ->
+            runCatching { hookReelsBannerRender(method) }
                 .onFailure {
                     Log.e(
                         TAG,
-                        "Failed to hook late feed list ${hook.method.declaringClass.name}.${hook.method.name}",
+                        "Failed to hook Reels banner render ${method.declaringClass.name}.${method.name}",
                         it
                     )
                 }
         }
-        hooks.storyPoolAddMethods.forEach { method ->
-            runCatching { hookStoryPoolAdd(method, feedItemInspector) }
-                .onFailure { Log.e(TAG, "Failed to hook story pool add ${method.declaringClass.name}.${method.name}", it) }
+        if (ENABLE_FEED_CSR_FILTER_HOOKS) {
+            hooks.feedCsrFilterMethods.forEach { method ->
+                runCatching { hookFeedCsrFilterInput(method, feedItemInspector) }
+                    .onFailure {
+                        Log.e(
+                            TAG,
+                            "Failed to hook feed CSR filter ${method.declaringClass.name}.${method.name}",
+                            it
+                        )
+                    }
+            }
+        } else {
+            Log.i(TAG, "Skipped feed CSR filter hooks to isolate feed Reels carousel loading")
         }
-        hooks.sponsoredPoolAddMethod?.let { hookSponsoredPoolAdd(it) }
-        hooks.sponsoredStoryNextMethod?.let { hookSponsoredStoryNext(it) }
+        if (ENABLE_LATE_FEED_LIST_HOOKS) {
+            hooks.lateFeedListHooks.forEach { hook ->
+                runCatching { hookLateFeedListSanitizer(hook, feedItemInspector) }
+                    .onFailure {
+                        Log.e(
+                            TAG,
+                            "Failed to hook late feed list ${hook.method.declaringClass.name}.${hook.method.name}",
+                            it
+                        )
+                    }
+            }
+        } else {
+            Log.i(TAG, "Skipped late feed list hooks to isolate feed Reels carousel loading")
+        }
+        if (ENABLE_STORY_POOL_ADD_HOOKS) {
+            hooks.storyPoolAddMethods.forEach { method ->
+                runCatching { hookStoryPoolAdd(method, feedItemInspector) }
+                    .onFailure {
+                        Log.e(TAG, "Failed to hook story pool add ${method.declaringClass.name}.${method.name}", it)
+                    }
+            }
+        } else {
+            Log.i(TAG, "Skipped story pool add hooks to isolate feed Reels carousel loading")
+        }
+        if (ENABLE_FEED_SPONSORED_POOL_HOOKS) {
+            hooks.sponsoredPoolAddMethod?.let { hookSponsoredPoolAdd(it) }
+            hooks.sponsoredStoryNextMethod?.let { hookSponsoredStoryNext(it) }
+        } else {
+            Log.i(TAG, "Skipped feed sponsored pool hooks to isolate feed Reels carousel loading")
+        }
         hooks.storyAdProviders.forEach { hookStoryAdProvider(it) }
-        hooks.sponsoredPoolClass?.let {
-            hookSponsoredPoolListMethods(it)
-            hookSponsoredPoolResultMethods(it)
+        if (ENABLE_FEED_SPONSORED_POOL_HOOKS) {
+            hooks.sponsoredPoolClass?.let {
+                hookSponsoredPoolListMethods(it)
+                hookSponsoredPoolResultMethods(it)
+            }
         }
         hooks.gameAdRequestMethods.forEach { method ->
             runCatching { hookGameAdRequest(method) }
@@ -654,16 +867,17 @@ fun installFacebookAdRemover(classLoader: ClassLoader, bridge: DexKitBridge) {
 
         Log.i(
             TAG,
-            "Installed hooks: append=${hooks.listBuilderAppendMethod.declaringClass.name}.${hooks.listBuilderAppendMethod.name}" +
-                ", factory=${hooks.listBuilderFactoryMethod?.let { "${it.declaringClass.name}.${it.name}" } ?: "none"}" +
-                ", plugin=${hooks.pluginPackBuildMethod?.let { "${it.declaringClass.name}.${it.name}" } ?: "none"}" +
+            "Installed hooks: append=${if (ENABLE_UPSTREAM_REELS_AD_HOOKS) "${hooks.listBuilderAppendMethod.declaringClass.name}.${hooks.listBuilderAppendMethod.name}" else "disabled"}" +
+                ", factory=${if (ENABLE_UPSTREAM_REELS_AD_HOOKS) hooks.listBuilderFactoryMethod?.let { "${it.declaringClass.name}.${it.name}" } ?: "none" else "disabled"}" +
+                ", plugin=${if (ENABLE_UPSTREAM_REELS_AD_HOOKS) hooks.pluginPackBuildMethod?.let { "${it.declaringClass.name}.${it.name}" } ?: "none" else "disabled"}" +
                 ", bannerState=${hooks.instreamBannerEligibilityMethod?.let { "${it.declaringClass.name}.${it.name}" } ?: "none"}" +
                 ", indicatorPill=${hooks.indicatorPillAdEligibilityMethod?.let { "${it.declaringClass.name}.${it.name}" } ?: "none"}" +
-                ", feedFilters=${hooks.feedCsrFilterMethods.joinToString { "${it.declaringClass.name}.${it.name}" }}" +
-                ", lateFeed=${hooks.lateFeedListHooks.joinToString { "${it.method.declaringClass.name}.${it.method.name}[${it.listArgIndex}]" }}" +
-                ", poolAdd=${hooks.storyPoolAddMethods.joinToString { "${it.declaringClass.name}.${it.name}" }}" +
-                ", feedPoolAdd=${hooks.sponsoredPoolAddMethod?.let { "${it.declaringClass.name}.${it.name}" } ?: "none"}" +
-                ", feedNext=${hooks.sponsoredStoryNextMethod?.let { "${it.declaringClass.name}.${it.name}" } ?: "none"}" +
+                ", reelsBanner=${hooks.reelsBannerRenderMethods.joinToString { "${it.declaringClass.name}.${it.name}" }}" +
+                ", feedFilters=${if (ENABLE_FEED_CSR_FILTER_HOOKS) hooks.feedCsrFilterMethods.joinToString { "${it.declaringClass.name}.${it.name}" } else "disabled"}" +
+                ", lateFeed=${if (ENABLE_LATE_FEED_LIST_HOOKS) hooks.lateFeedListHooks.joinToString { "${it.method.declaringClass.name}.${it.method.name}[${it.listArgIndex}]" } else "disabled"}" +
+                ", poolAdd=${if (ENABLE_STORY_POOL_ADD_HOOKS) hooks.storyPoolAddMethods.joinToString { "${it.declaringClass.name}.${it.name}" } else "disabled"}" +
+                ", feedPoolAdd=${if (ENABLE_FEED_SPONSORED_POOL_HOOKS) hooks.sponsoredPoolAddMethod?.let { "${it.declaringClass.name}.${it.name}" } ?: "none" else "disabled"}" +
+                ", feedNext=${if (ENABLE_FEED_SPONSORED_POOL_HOOKS) hooks.sponsoredStoryNextMethod?.let { "${it.declaringClass.name}.${it.name}" } ?: "none" else "disabled"}" +
                 ", storyProviders=${hooks.storyAdProviders.joinToString { it.providerClass.name }}" +
                 ", gameAds=${hooks.gameAdRequestMethods.joinToString { "${it.declaringClass.name}.${it.name}" }}" +
                 ", gameBridge=${hooks.gameAdBridgePostMessageMethod?.let { "${it.declaringClass.name}.${it.name}" } ?: "none"}" +
@@ -671,7 +885,7 @@ fun installFacebookAdRemover(classLoader: ClassLoader, bridge: DexKitBridge) {
                 ", gameAdUi=${hooks.gameAdUiActivityMethods.joinToString { "${it.declaringClass.name}.${it.name}" }}"
         )
     } catch (t: Throwable) {
-        Log.e(TAG, "Failed to install Facebook ad remover hooks", t)
+        Log.resolutionFailure(TAG, "Failed to install Facebook ad remover hooks", t)
     }
 }
 
@@ -720,6 +934,7 @@ private fun resolveHooks(classLoader: ClassLoader, bridge: DexKitBridge): Resolv
     val pluginMethod = pluginPackClass?.let { resolvePluginPackMethod(classLoader, it) }
     val instreamBannerEligibilityMethod = resolveInstreamBannerEligibilityMethod(classLoader, bridge)
     val indicatorPillAdEligibilityMethod = resolveIndicatorPillAdEligibilityMethod(classLoader, bridge)
+    val reelsBannerRenderMethods = resolveReelsBannerRenderMethods(classLoader, bridge)
     val feedCsrFilterMethods =
         resolveFeedCsrFilterMethods(classLoader, classGroups["feedCsrFilters"].orEmpty(), bridge)
     val lateFeedListHooks = resolveLateFeedListHooks(classLoader, bridge)
@@ -741,6 +956,7 @@ private fun resolveHooks(classLoader: ClassLoader, bridge: DexKitBridge): Resolv
     Log.i(TAG, "Resolved plugin pack=${pluginPackClass?.name ?: "none"}")
     Log.i(TAG, "Resolved banner state eligibility=${instreamBannerEligibilityMethod?.declaringClass?.name ?: "none"}")
     Log.i(TAG, "Resolved indicator pill eligibility=${indicatorPillAdEligibilityMethod?.declaringClass?.name ?: "none"}")
+    Log.i(TAG, "Resolved Reels banner render hooks=${reelsBannerRenderMethods.joinToString { it.declaringClass.name }}")
     Log.i(TAG, "Resolved feed CSR filters=${feedCsrFilterMethods.joinToString { it.declaringClass.name }}")
     Log.i(TAG, "Resolved late feed list hooks=${lateFeedListHooks.joinToString { it.method.declaringClass.name }}")
     Log.i(TAG, "Resolved story pool add hooks=${storyPoolAddMethods.joinToString { it.declaringClass.name }}")
@@ -755,6 +971,28 @@ private fun resolveHooks(classLoader: ClassLoader, bridge: DexKitBridge): Resolv
     Log.i(TAG, "Resolved game ad bridge=${gameAdBridgePostMessageMethod?.declaringClass?.name ?: "none"}")
     Log.i(TAG, "Resolved playable ad activity=${playableAdActivityOnCreate?.declaringClass?.name ?: "none"}")
     Log.i(TAG, "Resolved game ad UI activities=${gameAdUiActivityMethods.joinToString { it.declaringClass.name }}")
+    logMissingHooks(
+        pluginPackClass = pluginPackClass,
+        factoryMethod = factoryMethod,
+        pluginMethod = pluginMethod,
+        instreamBannerEligibilityMethod = instreamBannerEligibilityMethod,
+        indicatorPillAdEligibilityMethod = indicatorPillAdEligibilityMethod,
+        reelsBannerRenderMethods = reelsBannerRenderMethods,
+        feedCsrFilterMethods = feedCsrFilterMethods,
+        lateFeedListHooks = lateFeedListHooks,
+        storyPoolAddMethods = storyPoolAddMethods,
+        sponsoredPoolClass = sponsoredPoolClass,
+        poolAddMethod = poolAddMethod,
+        sponsoredStoryManagerClass = sponsoredStoryManagerClass,
+        sponsoredStoryNextMethod = sponsoredStoryNextMethod,
+        storyAdsDataSourceClass = storyAdsDataSourceClass,
+        storyAdsInDiscClass = storyAdsInDiscClass,
+        storyAdProviders = storyAdProviders,
+        gameAdRequestMethods = gameAdRequestMethods,
+        gameAdBridgePostMessageMethod = gameAdBridgePostMessageMethod,
+        playableAdActivityOnCreate = playableAdActivityOnCreate,
+        gameAdUiActivityMethods = gameAdUiActivityMethods
+    )
 
     return ResolvedHooks(
         adKindEnumClass = adKindEnumClass,
@@ -763,6 +1001,7 @@ private fun resolveHooks(classLoader: ClassLoader, bridge: DexKitBridge): Resolv
         pluginPackBuildMethod = pluginMethod,
         instreamBannerEligibilityMethod = instreamBannerEligibilityMethod,
         indicatorPillAdEligibilityMethod = indicatorPillAdEligibilityMethod,
+        reelsBannerRenderMethods = reelsBannerRenderMethods,
         feedCsrFilterMethods = feedCsrFilterMethods,
         lateFeedListHooks = lateFeedListHooks,
         storyPoolAddMethods = storyPoolAddMethods,
@@ -775,6 +1014,59 @@ private fun resolveHooks(classLoader: ClassLoader, bridge: DexKitBridge): Resolv
         playableAdActivityOnCreate = playableAdActivityOnCreate,
         gameAdUiActivityMethods = gameAdUiActivityMethods
     )
+}
+
+private fun logMissingHooks(
+    pluginPackClass: ClassData?,
+    factoryMethod: Method?,
+    pluginMethod: Method?,
+    instreamBannerEligibilityMethod: Method?,
+    indicatorPillAdEligibilityMethod: Method?,
+    reelsBannerRenderMethods: List<Method>,
+    feedCsrFilterMethods: List<Method>,
+    lateFeedListHooks: List<FeedListSanitizerHook>,
+    storyPoolAddMethods: List<Method>,
+    sponsoredPoolClass: ClassData?,
+    poolAddMethod: Method?,
+    sponsoredStoryManagerClass: ClassData?,
+    sponsoredStoryNextMethod: Method?,
+    storyAdsDataSourceClass: ClassData?,
+    storyAdsInDiscClass: ClassData?,
+    storyAdProviders: List<StoryAdProviderHooks>,
+    gameAdRequestMethods: List<Method>,
+    gameAdBridgePostMessageMethod: Method?,
+    playableAdActivityOnCreate: Method?,
+    gameAdUiActivityMethods: List<Method>
+) {
+    if (factoryMethod == null) Log.missing(TAG, "Reels list factory method")
+    if (pluginPackClass == null) {
+        Log.missing(TAG, "FbShortsViewerPluginPack class")
+    } else if (pluginMethod == null) {
+        Log.missing(TAG, "FbShortsViewerPluginPack build method")
+    }
+    if (instreamBannerEligibilityMethod == null) Log.missing(TAG, "Instream banner eligibility method")
+    if (indicatorPillAdEligibilityMethod == null) Log.missing(TAG, "Reels indicator pill eligibility method")
+    if (reelsBannerRenderMethods.isEmpty()) Log.missing(TAG, "Reels banner render methods")
+    if (feedCsrFilterMethods.isEmpty()) Log.missing(TAG, "Feed CSR filter methods")
+    if (lateFeedListHooks.isEmpty()) Log.missing(TAG, "Late feed list sanitizer methods")
+    if (storyPoolAddMethods.isEmpty()) Log.missing(TAG, "Story pool add methods")
+    if (sponsoredPoolClass == null) {
+        Log.missing(TAG, "Sponsored pool class")
+    } else if (poolAddMethod == null) {
+        Log.missing(TAG, "Sponsored pool add method")
+    }
+    if (sponsoredStoryManagerClass == null) {
+        Log.missing(TAG, "Sponsored story manager class")
+    } else if (sponsoredStoryNextMethod == null) {
+        Log.missing(TAG, "Sponsored story next method")
+    }
+    if (storyAdsDataSourceClass == null) Log.missing(TAG, "Story ads data source class")
+    if (storyAdsInDiscClass == null) Log.missing(TAG, "Story ads in-disc source class")
+    if (storyAdProviders.isEmpty()) Log.missing(TAG, "Story ad provider methods")
+    if (gameAdRequestMethods.isEmpty()) Log.missing(TAG, "Game ad request methods")
+    if (gameAdBridgePostMessageMethod == null) Log.missing(TAG, "Game ad bridge postMessage method")
+    if (playableAdActivityOnCreate == null) Log.missing(TAG, "Playable ad activity lifecycle method")
+    if (gameAdUiActivityMethods.isEmpty()) Log.missing(TAG, "Game ad UI activity lifecycle methods")
 }
 
 private fun resolveAdKindEnumClass(
@@ -1256,6 +1548,43 @@ private fun resolveIndicatorPillAdEligibilityMethod(
     }.firstOrNull()?.apply { isAccessible = true }
 }
 
+private fun resolveReelsBannerRenderMethods(
+    classLoader: ClassLoader,
+    bridge: DexKitBridge
+): List<Method> {
+    val componentClasses = LinkedHashMap<String, Class<*>>()
+
+    listOf("ReelsBannerAdsComponent", "ReelsBannerAdsNativeComponent").forEach { componentName ->
+        bridge.findClass {
+            matcher {
+                usingStrings(componentName)
+            }
+        }.forEach { candidate ->
+            val clazz = runCatching { candidate.getInstance(classLoader) }.getOrNull() ?: return@forEach
+            if (resolveLithoRenderMethod(clazz) != null) {
+                componentClasses.putIfAbsent(clazz.name, clazz)
+            }
+        }
+    }
+
+    return componentClasses.values.mapNotNull { clazz ->
+        resolveLithoRenderMethod(clazz)
+    }
+}
+
+private fun resolveLithoRenderMethod(componentClass: Class<*>): Method? {
+    return componentClass.declaredMethods.firstOrNull { method ->
+        !Modifier.isStatic(method.modifiers) &&
+            !method.isBridge &&
+            !method.isSynthetic &&
+            method.parameterCount == 1 &&
+            !method.returnType.isPrimitive &&
+            method.returnType != Void.TYPE &&
+            method.returnType != Any::class.java &&
+            method.returnType.isAssignableFrom(componentClass)
+    }?.apply { isAccessible = true }
+}
+
 private fun resolveSponsoredPoolAddMethod(classLoader: ClassLoader, sponsoredPoolClass: ClassData): Method? {
     val method = sponsoredPoolClass.findMethod {
         findFirst = true
@@ -1483,9 +1812,23 @@ private fun hookStoryPoolAdd(method: Method, feedItemInspector: FeedItemInspecto
     XposedBridge.hookMethod(method, object : XC_MethodHook() {
         override fun beforeHookedMethod(param: MethodHookParam) {
             val item = param.args.getOrNull(0)
-            if (!feedItemInspector.isSponsoredFeedItem(item)) return
+            if (!feedItemInspector.isDefinitelySponsoredFeedItem(item)) {
+                if (feedItemInspector.isSponsoredFeedItem(item)) {
+                    logHookHitThrottled(
+                        "storyPoolBroadAllowed",
+                        method,
+                        feedItemInspector.describe(item)
+                    )
+                }
+                return
+            }
+
             param.result = false
-            Log.i(TAG, "Blocked sponsored feed item from story pool in ${method.declaringClass.name}.${method.name}")
+            logHookHitThrottled(
+                "storyPoolStrictBlock",
+                method,
+                feedItemInspector.describe(item)
+            )
         }
     })
 }
@@ -1513,6 +1856,15 @@ private fun hookIndicatorPillAdEligibility(method: Method) {
             val pluginSlot = param.args.getOrNull(2)?.toString() ?: "unknown"
             logHookHitThrottled("indicatorPill", method, "slot=$pluginSlot")
             param.result = false
+        }
+    })
+}
+
+private fun hookReelsBannerRender(method: Method) {
+    XposedBridge.hookMethod(method, object : XC_MethodHook() {
+        override fun beforeHookedMethod(param: MethodHookParam) {
+            logHookHitThrottled("reelsBannerRender", method)
+            param.result = null
         }
     })
 }
