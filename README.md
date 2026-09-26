@@ -4,33 +4,87 @@ An LSPosed/Xposed module for `com.facebook.katana` that removes ads using struct
 
 Original port target: Facebook `576.0.0.42.73`; development/device testing also covers `580.0.0.51.74`. Module `1.21` (versionCode 22). Discovery is primarily structural rather than based on hardcoded obfuscated class names, but an individual hook can still need revision after a Facebook update. Older versions (571 and below) are no longer supported.
 
-## Scope
-
-- News Feed sponsored units
-- Story ads and in-disc story ads
-- Reels / upstream ad-backed story append paths
-- Quicksilver game ad requests
-- Audience Network and Neko playable ad activities used by games
-
 ## Features
 
-The module is more than an ad blocker, and the settings screen below is its whole surface. `ui/Toggles.kt` is the source of truth for every switch, its default and its exact effect — what follows is the map, not a second copy of it.
+Everything below is available from the module's settings app. The defaults shown here match the current app configuration.
 
-**Ads** (on by default)
+1. **Ads**
+   - **Block News Feed ads** *(ON by default)* — removes sponsored feed posts, multi-ad units and ad-channel requests.
+   - **Block Story ads** *(ON)* — blocks sponsored story buckets and story-player ad breaks.
+   - **Block Reels ads** *(ON)* — blocks dedicated Reels/Shorts ads and banners.
+   - **Block Marketplace ads** *(ON)* — removes sponsored tiles, boosted listings and Marketplace video ads.
+   - **Block game ads** *(ON)* — rejects interstitial, rewarded and banner ad requests in Facebook games; rewarded requests still resolve successfully so supported games can grant the reward.
+   - **Enable CSR feed ad guard** *(ON)* — adds extra News Feed cache/render protection for sponsored content.
 
-- **Block News Feed ads** — sponsored feed posts, ad-channel requests and multi-ad units; CSR/cache sponsored protection also requires the optional feed ad guard below.
-- **Block Story ads** — story ad buckets and story-player ad-break setters.
-- **Block Reels ads** — Reels/Shorts sponsored units, dedicated ad fetches and Reels banners; shared in-stream/video-ad hooks require the Story ads switch too.
-- **Block marketplace ads** — sponsored tiles, boosted listings and video ads in Marketplace.
-- **Block game ads** — in-app game ad requests are rejected; rewarded requests resolve as success, so the reward is still granted.
-- **Enable CSR feed ad guard** — extra sponsored News Feed protection on Facebook's cached feed path; follows the News Feed ads switch. AI and keyword rules remain independent.
-- **Hide Reels / Marketplace / Games tabs** — three independent Navigation controls hide only the tab-bar buttons, leaving all three destinations reachable through Facebook menu, search and links. Facebook 580 uses stable `TabBarContainerLayout.onChildViewAdded` and `onLayout` callbacks with tab-icon semantic numeric IDs; the layout hook also handles icons restored/reused without the hierarchy callback. A bounded horizontal navigation-bar label matcher backs it up for alternate top/bottom layouts. It never removes pages or navigation configuration and does not affect the separate Hide Reels feed filter. All three switches default OFF. On-device verified Reels-only, Marketplace-only, and all three enabled; Facebook reflows the remaining icons rather than leaving blank slots.
+2. **Feed filters**
+   - **Hide Threads posts** — removes Threads promotion stories from the feed.
+   - **Hide Reels** — removes Reels/Shorts stories from the News Feed.
+   - **Hide suggestions** — removes suggested/engagement stories.
+   - **Hide People You May Know** — removes People You May Know feed units.
+   - **Hide Stories in feed** — removes the Stories tray and its feed render.
+   - **Hide AI-generated content** — filters stories Facebook marks as self-disclosed or Meta-detected AI content.
+   - **Keyword filter** — hides feed stories containing any configured keyword, case-insensitively.
+   - **Block auto-refresh** *(Beta)* — blocks revisit, warm-start, foreground and forced News Feed refreshes.
 
-The three ad-surface switches are independent, including their direct DexKit hooks. Some generic video/ad-break methods are used by both Stories and Reels, and the generic banner class scan has no reliable UI context: those shared methods block only when **all** affected surface switches are on, rather than silently blocking a disabled surface. Facebook's global ad-free-session status spoof also runs only when all five ad-family switches (News Feed, Stories, Reels, Marketplace and Games) are enabled. Consequently, Story ads alone may not suppress every sponsored circle in the Stories tray: those previously relied on the global spoof. On upgrade, the retired `ads.enabled` master setting is migrated to the new switches once; the former Reels shopping-card toggle and dedicated hook are removed.
+3. **Stories**
+   - **View stories without marking seen** — blocks Facebook's seen-reporting controller.
+   - **Hide Stories tray** — keeps the Stories card out of the feed.
 
-**Feed filters** (off by default) — hide Threads posts, Reels, suggestions, People You May Know, Stories in feed, and AI-generated content (stories carrying the gen-AI transparency flag); a free-text **keyword filter**; and a News Feed **auto-refresh block**.
+4. **Appearance**
+   - **Force dark mode** — forces Facebook's dark theme.
+   - **AMOLED black mode** — converts Facebook's dark neutral backgrounds to true black while preserving text, media and intentional colored surfaces.
 
-### Shared feed-filtering engine
+5. **Privacy**
+   - **Allow screenshots & recording** — clears `FLAG_SECURE` from Facebook activities.
+   - **Block capture detection** — disables Facebook's screenshot and screen-recording watchers.
+
+6. **Navigation**
+   - **Hide Reels tab** — removes only the Reels button from Facebook's tab bar.
+   - **Hide Marketplace tab** — removes only the Marketplace tab button.
+   - **Hide Games tab** — removes only the Games/Gaming tab button.
+   - **Activity list (Intent dump)** — logs activities Facebook starts, including action, URI and extras.
+
+7. **Links**
+   - **Unwrap `l.php` redirect links** — rewrites Facebook tracking/redirect URLs to the real destination before opening them.
+
+8. **Downloader & Repost**
+   - **Download via browser** *(ON by default)* — hands media URLs to your browser instead of the built-in downloader.
+   - **Show contextual download actions** *(ON)* — adds media-bound download/save actions for the Reel or Story currently open.
+   - **Quick download from copied link** — copying an HTTP(S) link opens the quality-fetch / quick-download flow.
+   - **Repost Reels** — adds a native **Repost** action to the active Reel so it can be reposted through the module's Facebook Page posting flow.
+   - **Repost Stories** — adds **Repost** to the currently open Story's three-dot menu, bound to that Story's media.
+
+9. **Video**
+   - **Resume video position** — optionally restores the last saved playback position when reopening a video; manual seeking always takes priority.
+   - **Background playback** — keeps the tracked video playing while Facebook is backgrounded, without a floating window.
+
+10. **Account**
+    - **Export session** — exports Facebook authentication/session data and captured cookies.
+    - **Import latest** — restores the newest exported session.
+    - **Import from file** — restores a session backup selected from storage.
+
+11. **Module**
+    - **Show launcher icon** — show or hide the module's launcher icon without disabling the module itself.
+
+Unless marked **ON by default**, switches are **OFF by default**.
+
+## Support development
+
+If you find the module useful and want to support continued development:
+
+**[Buy me a coffee ☕](https://buymeacoffee.com/loukious)**
+
+## Feature details
+
+The settings screen is the source of truth for user-facing controls. `ui/Toggles.kt` defines their display order, defaults and hook-level descriptions. The sections below document implementation details and edge cases.
+
+### Ads
+
+The ad-surface switches are independent, including their direct DexKit hooks. Some generic video/ad-break methods are used by both Stories and Reels, and the generic banner class scan has no reliable UI context: those shared methods block only when **all** affected surface switches are on, rather than silently blocking a disabled surface. Facebook's global ad-free-session status spoof also runs only when all five ad-family switches (News Feed, Stories, Reels, Marketplace and Games) are enabled. Consequently, Story ads alone may not suppress every sponsored circle in the Stories tray: those previously relied on the global spoof. On upgrade, the retired `ads.enabled` master setting is migrated to the new switches once; the former Reels shopping-card toggle and dedicated hook are removed.
+
+### Feed filters
+
+#### Shared feed-filtering engine
 
 `hooks/FeedFilterEngine.kt` owns the reusable `FeedItemSignals` / `FeedFilterRule` / `FeedFilterEngine` contracts and keep/remove partition logic; `FeedContentRules.kt` owns the per-toggle rule set. A new feed-content rule is defined once and can run wherever a Facebook adapter supplies its signals. `AiTransparencyInspector.kt` provides one bounded, reflection-cached TreeJNI classifier shared by all data-layer adapters. The engine reads a single setting snapshot per list/render and fails open on unknown objects or unsupported reflection shapes.
 
@@ -46,23 +100,39 @@ Runtime rule counters use `FBAR.Filter` with `pipeline=CLASSIC`, `CSR_CACHE`, `L
 
 The shared `MethodCache` now validates Facebook version, module version and an explicit discovery schema, and rejects a snapshot if any cached method no longer resolves. A full discovery snapshot clears obsolete class entries. FeedGuard re-resolves every cached class's method *shape* and verifies CSR/late/Litho role counts; a stale or partial installation invalidates its sentinel and triggers a clean discovery on the **next** Facebook process, retaining whatever succeeded in the current process. A transient discovery exception is marked for retry, never recorded as a permanent `absent` result. Log `FBAR.Filter health stage=cache-install|full-scan|20s|90s` reports `NO_HOOK`, `HOOK_INSTALLED_NOT_INVOKED`, `INVOKED_NO_ITEMS`, `INVOKED_NO_REMOVALS` or `REMOVING`, plus separate installed/invoked/inspected/AI/removal counts. An installed hook alone is not evidence that it processes feed items.
 
-**Stories** — view stories without marking them seen; keep the Stories tray out of the feed.
+### Stories
 
-**Appearance** — force dark mode; optional **AMOLED black mode** ports Morphe's true-black theme logic, turning Facebook's dark neutral background palette into pure black while leaving dividers, text, colored surfaces, images and light mode alone.
+View stories without marking them seen; keep the Stories tray out of the feed.
 
-**Privacy** — allow screenshots and recording; block Facebook's own capture detection.
+### Appearance
 
-**Navigation** — activity list: dump every hidden activity Facebook starts (action, URI, extras) to the log.
+Force dark mode; optional **AMOLED black mode** ports Morphe's true-black theme logic, turning Facebook's dark neutral background palette into pure black while leaving dividers, text, colored surfaces, images and light mode alone.
 
-**Links** — unwrap `facebook.com/l.php?u=…&fbclid=…` redirect links to the real destination before the browser opens them.
+### Privacy
 
-**Downloader** — contextual download actions for the reel or story you are actually viewing, with the existing quality picker bound to that media ID; **Copy URL** copies only the currently selected quality; hand media to the browser instead of the in-module downloader; quick-download from a copied link. Reels get native **Download** and **Repost** sidebar buttons, and stories get **Repost** in the three-dot menu. Repost reuses the existing Facebook Page posting flow (the page list comes from `graph.facebook.com`, the token from the live session).
+Allow screenshots and recording; block Facebook's own capture detection.
+
+### Navigation
+
+Hide selected tab-bar entries without removing their destinations, or enable the activity-list logger to dump hidden activities Facebook starts.
+
+### Links
+
+Unwrap `facebook.com/l.php?u=…&fbclid=…` redirect links to the real destination before the browser opens them.
+
+### Downloader
+
+Contextual download actions target the Reel or Story you are actually viewing, with the quality picker bound to that media ID; **Copy URL** copies only the currently selected quality; media can be handed to the browser instead of the in-module downloader; copied links can trigger quick-download. Reels get native **Download** and **Repost** sidebar buttons, and Stories get **Repost** in the three-dot menu. Repost reuses the existing Facebook Page posting flow (the page list comes from `graph.facebook.com`, the token from the live session).
 
 The reel button is built with Facebook's own sidebar factory. Discovery fingerprints the sidebar's name and call structure rather than obfuscated class names; the factory signature validator accepts the known argument layout plus additional trailing boolean feature flags, preserving their live values from the reel being rendered. A changed meaning/order of the existing arguments fails closed with a log instead of calling the wrong factory. Reel discovery failures are retried after 72 hours (or immediately on a hook-schema or Facebook version change), and a failed cached hook is invalidated for rediscovery at the next Facebook start. See `ReelFactorySignatureTest` for 578/580 and forward-compatibility cases.
 
-**Video** — optional video resume (**OFF by default**): saved-position restoration is a one-shot operation when a video opens; short Reels (including saved points around one second) get an earlier restore decision. Facebook's pooled player also seeks with `BY_AUTOPLAY` on revisits, sometimes resetting to zero: this is not treated as a user scrub, its pre-reset position is preserved, and a genuine Reel departure permits a new one-shot session. Genuine forward/back scrubbing cancels a pending restore and cannot rearm it through Facebook's repeated playback-start events. Seeking to the beginning clears an old saved point; a natural subsecond stop does not. Background playback with no floating window is separate; its stale-position clamp does not rewrite foreground manual seeks. An explicitly saved ON preference is preserved when upgrading; turn it OFF in settings to disable it on existing installations.
+### Video
 
-**Account** — session export/import. **Module** — launcher-icon visibility. Both are described below.
+Optional video resume (**OFF by default**) restores a saved position once when reopening a video; short Reels get an earlier restore decision. Facebook's pooled player can seek automatically during Reel transitions, so the hook separates automatic positioning from genuine user scrubbing and includes a visit-level guard against repeated restore loops. Background playback is separate and keeps the tracked player active without a floating window.
+
+### Account and Module
+
+Session export/import and launcher-icon visibility are described below.
 
 ## Settings App
 
