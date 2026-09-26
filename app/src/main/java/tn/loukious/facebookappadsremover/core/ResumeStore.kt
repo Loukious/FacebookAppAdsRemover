@@ -100,6 +100,13 @@ object ResumeStore {
         scheduleFlush()
     }
 
+    /** A deliberate seek near the beginning must clear an older far-ahead
+     * resume point; ignoring <1000 ms would make the next open jump forward.
+     */
+    fun remove(videoId: String) {
+        if (entries.remove(videoId) != null) scheduleFlush()
+    }
+
     /**
      * Refreshes only the timestamp (mod: QnHm's re-save of an unchanged
      * entry when the same video restarts within the 5 s window).

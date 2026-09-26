@@ -18,26 +18,24 @@ import java.util.concurrent.ConcurrentHashMap
 import java.util.concurrent.atomic.AtomicInteger
 
 /**
- * CSR-experiment feed guard — port of our own pre-rewrite feed experiment
- * filters (Patches.kt: the FeedCSRCacheFilter input/result hooks, the
- * late-feed list sanitizers and the structural Litho component guard),
- * re-based from the legacy XposedBridge API onto libxposed.
+ * CSR/cache/Litho adapters for the shared FeedFilterEngine. Discovery and
+ * Facebook-specific collection reconstruction stay here; policy and toggle
+ * precedence live in FeedContentRules for every supported feed pipeline.
  *
  * Facebook serves some accounts the News Feed through the CSR (Composite
  * Surface Renderer) pipeline instead of the classic FeedUnit pipeline those
  * users never reach. The classic hooks (NewsfeedFilterHook on
- * processNewStories, AdFilterHook's story blockers) never see that traffic,
- * so sponsored stories sailed through. Three mechanisms, all preserved from
- * the old implementation:
+ * processNewStories, AdFilterHook's story blockers) never see that traffic.
+ * Three adapter mechanisms share the same rule engine:
  *
  *  1. CSR CACHE FILTERS — the CSR pipeline caches feed units through
  *     year-versioned filter classes (FeedCSRCacheFilter{,2025H1,2026H1,
  *     2026H2}; the class set rotates with FB's experiment cohorts). Their
  *     entry points take (FbUserSession, …, ImmutableList, int) and return a
- *     list-bearing result object: sponsored items are dropped from the input
+ *     list-bearing result object: matched items are dropped from the input
  *     list BEFORE the filter runs (rebuilt via ImmutableList.copyOf) and the
  *     kept-list is re-filtered from the RESULT afterwards, so nothing
- *     sponsored survives into the CSR cache.
+ *     matched items survive into the CSR cache.
  *
  *  2. LATE-FEED SANITIZERS — three shapes of "the feed list is already
  *     cached, consume it" consumers (storage-lifecycle classes, the story
@@ -48,7 +46,7 @@ import java.util.concurrent.atomic.AtomicInteger
  *  3. COMPONENT GUARD — cached feed rows render through Litho components
  *     whose spec names survive obfuscation as string constants
  *     ("NewsFeedFeedUnitComponent" / "LoggingComponent"). The component
- *     holds the GraphQLFeedUnitEdge; when that edge is definitely sponsored
+ *     holds the GraphQLFeedUnitEdge; when that edge matches an enabled rule,
  *     the render/layout method is nulled so Litho skips the row entirely.
  *
  * The classifier is reflection-by-shape only (FeedItemInspector): category
@@ -76,7 +74,9 @@ object FeedGuardHook {
     private const val KEY_CLASSES = "classes"
 
     /** MethodCache class-map key when persisting through the shared cache. */
-    const val CACHE_KEY = "feed.guard.classes"
+    // The previous sponsored-only snapshot contained eleven class names but
+    // zero usable hooks on FB 580. Rediscover once for the shared rule engine.
+    const val CACHE_KEY = "feed.guard.classes.rule-engine-v2"
 
     /** Role prefixes in the cached/returned class list. */
     private const val ROLE_CSR = "csr:"
@@ -116,9 +116,6 @@ object FeedGuardHook {
     /** Litho spec names — final String constants on the generated components. */
     private const val FEED_UNIT_COMPONENT_NAME = "NewsFeedFeedUnitComponent"
     private const val FEED_WRAPPER_COMPONENT_NAME = "LoggingComponent"
-
-    /** Litho layout entry-point arities seen across builds (A1F/A1H on 576). */
-    private val FEED_RENDER_PARAMETER_COUNTS = listOf(1, 2)
 
     /** Categories that mark a feed unit as an ad (constants of GraphQLFeedStoryCategory-like enums). */
     private val FEED_AD_CATEGORY_VALUES = setOf(
@@ -189,16 +186,20 @@ object FeedGuardHook {
 
     @Volatile
     private var feedInspector: FeedItemInspector? = null
+    @Volatile
+    private var lastDiscoveryFailed = false
 
-    /**
-     * Master ad-block switch (same gate as AdFilterHook — the feed guard
-     * rides the mod's one swHOME_ADS switch). Re-read per invocation so
-     * flipping the toggle applies without a reinstall; the old port gated
-     * only at install time.
-     */
-    private fun enabled(): Boolean =
-        Settings.getBoolean(Settings.ADS_ENABLED, true) &&
-            Settings.getBoolean(Settings.ADS_FEED_GUARD, true)
+    /** Pipeline adapters share the rule engine, not an ad-only switch. */
+    private fun engine(pipeline: FeedPipeline): FeedFilterEngine =
+        FeedContentRules.engine(pipeline, cacheSignals)
+
+    private val cacheSignals = object : FeedItemSignals {
+        override fun category(item: Any): String? = inspector().categoryForFilter(item)
+        override fun sponsored(item: Any): Boolean = inspector().isDefinitelySponsoredFeedItem(item)
+        override fun aiContent(item: Any): Boolean = inspector().isAiContentFeedItem(item)
+        override fun searchableText(item: Any): String? =
+            runCatching { item.toString() }.getOrNull()
+    }
 
     private fun inspector(): FeedItemInspector {
         feedInspector?.let { return it }
@@ -228,15 +229,27 @@ object FeedGuardHook {
     ): List<String> {
         appClassLoader = classLoader
         val found = LinkedHashSet<String>()
+        lastDiscoveryFailed = false
 
         runCatching { installCsrFilters(module, bridge, classLoader, found) }
-            .onFailure { L.w(TAG, "CSR filter discovery failed", it) }
+            .onFailure {
+                lastDiscoveryFailed = true
+                L.w(TAG, "CSR filter discovery failed", it)
+            }
         runCatching { installLateFeedSanitizers(module, bridge, classLoader, found) }
-            .onFailure { L.w(TAG, "Late-feed sanitizer discovery failed", it) }
+            .onFailure {
+                lastDiscoveryFailed = true
+                L.w(TAG, "Late-feed sanitizer discovery failed", it)
+            }
         runCatching { installComponentGuard(module, bridge, classLoader, found) }
-            .onFailure { L.w(TAG, "Feed component guard failed", it) }
+            .onFailure {
+                lastDiscoveryFailed = true
+                L.w(TAG, "Feed component guard failed", it)
+            }
 
         L.i(TAG, "full scan: ${found.size} cacheable class(es)")
+        FeedFilterDiagnostics.scheduleHealth()
+        FeedFilterDiagnostics.logHealth("full-scan")
         return found.toList()
     }
 
@@ -362,30 +375,74 @@ object FeedGuardHook {
     ): Boolean {
         if (cached.isEmpty()) return false
         appClassLoader = classLoader
+        val expectedCsr = cached.count { FeedGuardCacheEntry.parse(it)?.role == ROLE_CSR }
+        val expectedLate = cached.count { FeedGuardCacheEntry.parse(it)?.role == ROLE_LATE }
+        val expectedComponent = cached.any { FeedGuardCacheEntry.parse(it)?.role == ROLE_COMPONENT }
+        val expectedWrapper = cached.any { FeedGuardCacheEntry.parse(it)?.role == ROLE_WRAPPER }
+        var installedCsr = 0
+        var installedLate = 0
+        var alreadyCsr = 0
+        var alreadyLate = 0
+        var invalidEntries = 0
         var installed = 0
         for (entry in cached) {
             runCatching {
-                val role = entry.substringBefore(':', "")
-                val className = entry.substringAfter(':', "")
-                if (className.isBlank()) return@runCatching
-                val cls = Class.forName(className, false, classLoader)
-                when (role) {
-                    ROLE_CSR -> resolveCsrHookForClass(cls)?.let {
-                        if (hookCsrFilter(module, it)) installed++
+                val parsed = FeedGuardCacheEntry.parse(entry)
+                if (parsed == null) {
+                    invalidEntries++
+                    return@runCatching
+                }
+                val cls = Class.forName(parsed.className, false, classLoader)
+                when (parsed.role) {
+                    ROLE_CSR -> {
+                        val hook = resolveCsrHookForClass(cls) ?: return@runCatching
+                        if (hookCsrFilter(module, hook)) {
+                            installed++
+                            installedCsr++
+                        } else if (methodHookKey(hook.method) in hookedMethodKeys) {
+                            alreadyCsr++
+                        }
                     }
-                    ROLE_LATE -> resolveLateHookForClass(cls)?.let {
-                        if (hookLateFeedList(module, it)) installed++
+                    ROLE_LATE -> {
+                        val hook = resolveLateHookForClass(cls) ?: return@runCatching
+                        if (hookLateFeedList(module, hook)) {
+                            installed++
+                            installedLate++
+                        } else if (methodHookKey(hook.method) in hookedMethodKeys) {
+                            alreadyLate++
+                        }
                     }
                     ROLE_COMPONENT -> componentCandidates.putIfAbsent(cls.name, cls)
                     ROLE_WRAPPER -> wrapperCandidates.putIfAbsent(cls.name, cls)
+                    else -> invalidEntries++
                 }
-            }.onFailure { L.w(TAG, "cached install failed for $entry", it) }
+            }.onFailure {
+                invalidEntries++
+                L.w(TAG, "cached install failed for $entry", it)
+            }
         }
         // The guard needs the full component × wrapper cross product, so it
         // runs after every registry entry has been re-registered.
-        installed += installComponentGuard(module)
-        L.i(TAG, "cached install: $installed hook(s) from ${cached.size} class(es)")
-        return installed > 0
+        val installedComponent = installComponentGuard(module)
+        installed += installedComponent
+        val readyCsr = installedCsr + alreadyCsr
+        val readyLate = installedLate + alreadyLate
+        val readyComponent = installedComponent > 0 ||
+            (expectedComponent && FeedFilterDiagnostics.installedCount(FeedPipeline.LITHO_RENDER) > 0)
+        val complete = invalidEntries == 0 && readyCsr == expectedCsr && readyLate == expectedLate &&
+            expectedComponent == expectedWrapper &&
+            (!expectedComponent || readyComponent) &&
+            (installed > 0 || alreadyCsr + alreadyLate > 0 || readyComponent) &&
+            expectedCsr + expectedLate +
+            (if (expectedComponent) 1 else 0) > 0
+        L.i(TAG, "cached install: $installed hook(s) from ${cached.size} class(es); " +
+            "csr=$readyCsr/$expectedCsr late=$readyLate/$expectedLate " +
+            "litho=$installedComponent ready=$readyComponent " +
+            "expected=${expectedComponent && expectedWrapper} invalid=$invalidEntries " +
+            "complete=$complete")
+        FeedFilterDiagnostics.scheduleHealth()
+        FeedFilterDiagnostics.logHealth("cache-install")
+        return complete
     }
 
     // ------------------------------------------------------------------
@@ -426,7 +483,8 @@ object FeedGuardHook {
      * force a rescan (checked from ModuleMain.installFromCache).
      */
     fun cachePresent(context: Context): Boolean =
-        runCatching { MethodCache.loadClass(context, CACHE_KEY) }.getOrNull() != null
+        runCatching { MethodCache.loadClass(context, CACHE_KEY) }.getOrNull()
+            ?.let { it != "retry" } == true
 
     /**
      * Cache-hit install through the shared class map: reads the stored
@@ -439,9 +497,19 @@ object FeedGuardHook {
         when {
             state == null -> return
             state == "absent" -> L.i(TAG, "anchor not found on this build — skipping")
-            else -> runCatching {
+            else -> {
+                val fullyRestored = runCatching {
                 installCached(module, classLoader, context, state.split(',').toSet())
-            }.onFailure { L.e(TAG, "cached installation failed", it) }
+                }.onFailure { L.e(TAG, "cached installation failed", it) }
+                    .getOrDefault(false)
+                if (!fullyRestored) {
+                    // Don't immediately rescan and double-hook the other mod
+                    // features. Keep restored guards active, but force fresh
+                    // discovery on the next clean Facebook process.
+                    L.w(TAG, "stale/partial cache; rediscover feed guards next FB start")
+                    MethodCache.invalidateClass(context, CACHE_KEY)
+                }
+            }
         }
     }
 
@@ -455,11 +523,15 @@ object FeedGuardHook {
         bridge: DexKitBridge,
         classLoader: ClassLoader,
         context: Context,
-    ): String =
-        runCatching { install(module, bridge, classLoader, context) }
+    ): String {
+        val found = runCatching { install(module, bridge, classLoader, context) }
             .onFailure { L.e(TAG, "installation failed", it) }
-            .getOrDefault(emptyList())
-            .takeIf { it.isNotEmpty() }?.joinToString(",") ?: "absent"
+            .getOrNull() ?: return "retry"
+        // An empty scan on an unsupported FB version is genuinely absent.
+        // A DexKit exception is not absence and must be retried next launch.
+        if (lastDiscoveryFailed) return "retry"
+        return found.takeIf { it.isNotEmpty() }?.joinToString(",") ?: "absent"
+    }
 
     private fun hostVersionCode(context: Context): Int = runCatching {
         val pi = context.packageManager.getPackageInfo(context.packageName, 0)
@@ -480,92 +552,62 @@ object FeedGuardHook {
     /** A late-feed list consumer: method + index of its ImmutableList arg. */
     private data class FeedListSanitizerHook(val method: Method, val listArgIndex: Int)
 
-    /** The three late-feed shapes; each fixes its list-arg index. */
-    private enum class LateFeedShape(val listArgIndex: Int) {
-        /** void m(any, ImmutableList, int) */
-        STORAGE(1),
-
-        /** void m(ImmutableList, String) */
-        VENDING(0),
-
-        /** void m(FbUserSession, any, ImmutableList) */
-        LIFECYCLE(2),
+    /** Late-cache class anchors distinguish storage, vending and lifecycle. */
+    private enum class LateFeedShape(val signatureKind: FeedHookSignatures.LateKind) {
+        STORAGE(FeedHookSignatures.LateKind.STORAGE),
+        VENDING(FeedHookSignatures.LateKind.VENDING),
+        LIFECYCLE(FeedHookSignatures.LateKind.LIFECYCLE),
     }
 
-    /**
-     * First non-static-synthetic non-abstract method up the hierarchy that
-     * matches — the reflection equivalent of the old DexKit findMethod with
-     * paramTypes/returnType matchers, reused verbatim on the cache-hit path.
+    /** Resolve only uniquely matched candidates; never take the first method
+     * merely because it happens to accept an ImmutableList.
      */
-    private fun firstHookableMethod(cls: Class<*>, matches: (Method) -> Boolean): Method? {
+    private fun resolveListMethod(
+        cls: Class<*>,
+        select: (List<FeedHookSignatures.MethodInfo>) -> FeedHookSignatures.ListMatch?,
+    ): Pair<Method, Int>? {
         var current: Class<*>? = cls
         while (current != null && current != Any::class.java) {
             val type = current
-            val found = type.declaredMethods.firstOrNull { m ->
-                !Modifier.isAbstract(m.modifiers) &&
-                    !m.isSynthetic &&
-                    !m.isBridge &&
-                    matches(m)
+            val methods = type.declaredMethods.toList()
+            val match = select(methods.map(FeedHookSignatures::describe))
+            if (match != null) {
+                val found = methods.firstOrNull {
+                    FeedHookSignatures.describe(it) == match.method
+                } ?: return null
+                found.isAccessible = true
+                return found to match.listArgIndex
             }
-            if (found != null) return found.apply { isAccessible = true }
             current = type.superclass
         }
         return null
     }
 
-    /**
-     * CSR entry-point shapes (old resolveFeedCsrFilterMethods):
-     *   4-arg (FbUserSession, any, ImmutableList, int) → list at index 2
-     *   3-arg (FbUserSession, ImmutableList, int)       → list at index 1
+    /** CSR class is anchored by FeedCSRCacheFilter strings, then signature
+     * is resolved by its unique FbUserSession, ImmutableList and int roles.
+     * Extra/reordered arguments do not change the dynamically resolved index.
      */
     private fun resolveCsrHookForClass(cls: Class<*>): FeedCsrFilterHook? {
         if (cls.isInterface || Modifier.isAbstract(cls.modifiers)) return null
-        val fourArg = firstHookableMethod(cls) { m ->
-            val p = m.parameterTypes
-            p.size == 4 &&
-                p[0].name == FB_USER_SESSION_CLASS &&
-                p[2].name == IMMUTABLE_LIST_CLASS &&
-                p[3] == Int::class.javaPrimitiveType
-        }
-        if (fourArg != null) return FeedCsrFilterHook(fourArg, 2)
-        val threeArg = firstHookableMethod(cls) { m ->
-            val p = m.parameterTypes
-            p.size == 3 &&
-                p[0].name == FB_USER_SESSION_CLASS &&
-                p[1].name == IMMUTABLE_LIST_CLASS &&
-                p[2] == Int::class.javaPrimitiveType
-        }
-        return threeArg?.let { FeedCsrFilterHook(it, 1) }
+        return resolveListMethod(cls, FeedHookSignatures::csr)
+            ?.let { (method, listIndex) -> FeedCsrFilterHook(method, listIndex) }
     }
 
     private fun resolveLateHookForClass(cls: Class<*>): FeedListSanitizerHook? {
-        for (shape in LateFeedShape.values()) {
-            resolveLateHookForClass(cls, shape)?.let { return it }
+        val candidates = LateFeedShape.values().mapNotNull {
+            resolveLateHookForClass(cls, it)
         }
-        return null
+        if (candidates.size > 1) {
+            L.w(TAG, "multiple late-cache method roles in ${cls.name}; refusing ambiguous hook")
+        }
+        return candidates.singleOrNull()
     }
 
     private fun resolveLateHookForClass(cls: Class<*>, shape: LateFeedShape): FeedListSanitizerHook? {
         if (cls.isInterface || Modifier.isAbstract(cls.modifiers)) return null
-        val method = firstHookableMethod(cls) { m ->
-            m.returnType == Void.TYPE && matchesLateShape(m.parameterTypes, shape)
-        } ?: return null
-        return FeedListSanitizerHook(method, shape.listArgIndex)
-    }
-
-    private fun matchesLateShape(params: Array<Class<*>>, shape: LateFeedShape): Boolean = when (shape) {
-        LateFeedShape.STORAGE ->
-            params.size == 3 &&
-                params[1].name == IMMUTABLE_LIST_CLASS &&
-                params[2] == Int::class.javaPrimitiveType
-        LateFeedShape.VENDING ->
-            params.size == 2 &&
-                params[0].name == IMMUTABLE_LIST_CLASS &&
-                params[1] == String::class.java
-        LateFeedShape.LIFECYCLE ->
-            params.size == 3 &&
-                params[0].name == FB_USER_SESSION_CLASS &&
-                params[2].name == IMMUTABLE_LIST_CLASS
+        return resolveListMethod(cls) {
+            FeedHookSignatures.late(it, shape.signatureKind)
+        }?.let { (method, listIndex) -> FeedListSanitizerHook(method, listIndex) }
     }
 
     // ------------------------------------------------------------------
@@ -579,26 +621,34 @@ object FeedGuardHook {
     }
 
     private fun hookCsrFilter(module: XposedInterface, hook: FeedCsrFilterHook): Boolean {
-        if (!hookedMethodKeys.add(methodHookKey(hook.method))) return false
+        val key = methodHookKey(hook.method)
+        if (!hookedMethodKeys.add(key)) return false
         return runCatching {
             hook.method.isAccessible = true
             module.hook(hook.method).intercept(CsrFilterHooker(hook.method, hook.listArgIndex))
-            L.i(TAG, "hooked CSR filter: ${hook.method.declaringClass.name}.${hook.method.name}/${hook.listArgIndex}")
+            FeedFilterDiagnostics.installed(FeedPipeline.CSR_CACHE)
+            L.i(TAG, "hooked CSR filter: ${hook.method.declaringClass.name}.${hook.method.name}" +
+                "/${hook.method.parameterCount} listAt=${hook.listArgIndex}")
             true
         }.getOrElse {
+            hookedMethodKeys.remove(key)
             L.w(TAG, "CSR filter hook failed: ${hook.method.declaringClass.name}.${hook.method.name}", it)
             false
         }
     }
 
     private fun hookLateFeedList(module: XposedInterface, hook: FeedListSanitizerHook): Boolean {
-        if (!hookedMethodKeys.add(methodHookKey(hook.method))) return false
+        val key = methodHookKey(hook.method)
+        if (!hookedMethodKeys.add(key)) return false
         return runCatching {
             hook.method.isAccessible = true
             module.hook(hook.method).intercept(LateFeedHooker(hook.method, hook.listArgIndex))
-            L.i(TAG, "hooked late-feed sanitizer: ${hook.method.declaringClass.name}.${hook.method.name}/${hook.listArgIndex}")
+            FeedFilterDiagnostics.installed(FeedPipeline.LATE_CACHE)
+            L.i(TAG, "hooked late-feed sanitizer: ${hook.method.declaringClass.name}.${hook.method.name}" +
+                "/${hook.method.parameterCount} listAt=${hook.listArgIndex}")
             true
         }.getOrElse {
+            hookedMethodKeys.remove(key)
             L.w(TAG, "late-feed hook failed: ${hook.method.declaringClass.name}.${hook.method.name}", it)
             false
         }
@@ -612,8 +662,8 @@ object FeedGuardHook {
      * Cross product of registered components × wrappers: a pair matches when
      * the component declares an edge field, the wrapper declares a child
      * field typed as the component, and the two share a Litho layout
-     * context type at a known arity. Every render method of a matched pair
-     * is hooked; render methods are matched by shape because their
+     * context type at a bounded, uniquely matched signature. Every render
+     * method of a matched pair is hooked; render methods are matched by shape because their
      * obfuscated names rotate per build (A1H on 571, A1F+A1H on 576).
      *
      * @return the number of render methods newly hooked
@@ -627,29 +677,39 @@ object FeedGuardHook {
                 if (wrapperClass == componentClass) continue
                 val wrapperChildField = runCatching { resolveWrapperChildField(wrapperClass, componentClass) }
                     .getOrNull() ?: continue
-                val renderMethods = FEED_RENDER_PARAMETER_COUNTS.firstNotNullOfOrNull { parameterCount ->
-                    val layoutContextType = runCatching {
-                        resolveLithoLayoutContextType(componentClass, wrapperClass, parameterCount)
-                    }.getOrNull() ?: return@firstNotNullOfOrNull null
-                    val methods = listOf(componentClass, wrapperClass).flatMap { type ->
-                        lithoLayoutMethods(type, layoutContextType, parameterCount)
-                    }
-                    methods.ifEmpty { null }
-                } ?: continue
+                val resolution = FeedLithoSignatures.resolve(componentClass, wrapperClass)
+                if (resolution == null) {
+                    L.w(TAG, "Litho render signature unresolved/ambiguous: " +
+                        "${componentClass.name} + ${wrapperClass.name}")
+                    continue
+                }
+                val renderMethods = resolution.methods
 
-                resolvedComponentNames.add(componentClass.name)
-                resolvedWrapperNames.add(wrapperClass.name)
+                var paired = false
                 for (method in renderMethods) {
-                    if (!hookedMethodKeys.add(methodHookKey(method))) continue
+                    val key = methodHookKey(method)
+                    if (!hookedMethodKeys.add(key)) {
+                        paired = true // Previously installed matching method.
+                        continue
+                    }
                     runCatching {
                         method.isAccessible = true
                         module.hook(method).intercept(
                             ComponentGuardHooker(componentClass, wrapperClass, edgeField, wrapperChildField, method)
                         )
                         installed++
+                        paired = true
+                        FeedFilterDiagnostics.installed(FeedPipeline.LITHO_RENDER)
+                        L.i(TAG, "Litho render hook ${method.declaringClass.name}.${method.name}" +
+                            "/${method.parameterCount} ctxAt=${resolution.contextIndex}")
                     }.onFailure {
+                        hookedMethodKeys.remove(key)
                         L.w(TAG, "component guard hook failed: ${method.declaringClass.name}.${method.name}", it)
                     }
+                }
+                if (paired) {
+                    resolvedComponentNames.add(componentClass.name)
+                    resolvedWrapperNames.add(wrapperClass.name)
                 }
             }
         }
@@ -678,43 +738,6 @@ object FeedGuardHook {
         }.getOrDefault(emptyList())
         classes.forEach { discovered -> registry.putIfAbsent(discovered.name, discovered) }
         L.i(TAG, "Litho component name=$componentName classes=${classes.joinToString { it.name }}")
-    }
-
-    /** Static builder factories share the layout shape — only instance methods hook. */
-    private fun lithoLayoutMethods(
-        type: Class<*>,
-        contextType: Class<*>,
-        parameterCount: Int,
-    ): List<Method> {
-        return type.declaredMethods.filter { method ->
-            !Modifier.isStatic(method.modifiers) &&
-                method.parameterCount == parameterCount &&
-                !method.returnType.isPrimitive &&
-                method.parameterTypes[0] == contextType
-        }.onEach { it.isAccessible = true }
-    }
-
-    /** The Litho context type both classes accept; falls back to the component's most common. */
-    private fun resolveLithoLayoutContextType(
-        componentClass: Class<*>,
-        wrapperClass: Class<*>,
-        parameterCount: Int,
-    ): Class<*>? {
-        fun contextCandidates(type: Class<*>): List<Class<*>> {
-            return type.declaredMethods
-                .filter { method ->
-                    !Modifier.isStatic(method.modifiers) &&
-                        method.parameterCount == parameterCount &&
-                        !method.returnType.isPrimitive &&
-                        !method.parameterTypes[0].isPrimitive
-                }
-                .map { it.parameterTypes[0] }
-        }
-
-        val componentCandidates = contextCandidates(componentClass)
-        val wrapperCandidates = contextCandidates(wrapperClass).toSet()
-        return componentCandidates.firstOrNull { it in wrapperCandidates }
-            ?: componentCandidates.groupingBy { it }.eachCount().maxByOrNull { it.value }?.key
     }
 
     /**
@@ -800,45 +823,53 @@ object FeedGuardHook {
     // Hookers
     // ------------------------------------------------------------------
 
-    /**
-     * CSR cache filter, both phases of the old hook: filter the input list
-     * before the original runs, then re-filter the kept-list it returns.
-     */
+    /** CSR cache filter: apply the shared rules before and after Facebook's cache pass. */
     private class CsrFilterHooker(
         private val hookMethod: Method,
         private val listArgIndex: Int,
     ) : Hooker {
         override fun intercept(chain: XposedInterface.Chain): Any? {
-            val newArgs = if (enabled()) runCatching { filterListArg(chain) }.getOrNull() else null
+            FeedFilterDiagnostics.invoked(FeedPipeline.CSR_CACHE)
+            val filter = engine(FeedPipeline.CSR_CACHE)
+            val newArgs = if (filter.active) runCatching { filterListArg(chain, filter) }.getOrNull() else null
             val result = if (newArgs != null) chain.proceed(newArgs) else chain.proceed()
-            if (!enabled()) return result
-            return runCatching { filterResult(result) }.getOrNull() ?: result
+            if (!filter.active) return result
+            return runCatching { filterResult(result, filter) }.getOrNull() ?: result
         }
 
-        /** Before phase: drop sponsored items from the input ImmutableList. */
-        private fun filterListArg(chain: XposedInterface.Chain): Array<Any?>? = runCatching {
+        /** Before phase: apply all enabled rules to the input ImmutableList. */
+        private fun filterListArg(
+            chain: XposedInterface.Chain,
+            filter: FeedFilterEngine,
+        ): Array<Any?>? = runCatching {
             val original = chain.args.getOrNull(listArgIndex) as? Iterable<*> ?: return@runCatching null
-            val (kept, removed) = partitionSponsored(original)
-            if (removed <= 0) return@runCatching null
-            val rebuilt = buildImmutableListLike(chain.args[listArgIndex], kept) ?: return@runCatching null
+            val partition = filter.partition(original)
+            FeedFilterDiagnostics.batch(FeedPipeline.CSR_CACHE, partition)
+            if (partition.removed <= 0) return@runCatching null
+            val rebuilt = buildImmutableListLike(chain.args[listArgIndex], partition.kept) ?: return@runCatching null
             val newArgs: Array<Any?> = chain.args.toTypedArray()
             newArgs[listArgIndex] = rebuilt
-            logHookHitThrottled("csrFilterIn", hookMethod) { "removed=$removed" }
+            logHookHitThrottled("csrFilterIn", hookMethod) {
+                "inspected=${partition.inspected} removed=${partition.removed} rules=${partition.removedByRule}"
+            }
             newArgs
         }.getOrNull()
 
         /**
          * After phase: the result carries the list the filter decided to
-         * keep — rebuild it (and its stats fields) without the sponsored
+         * keep — rebuild it (and its stats fields) without the matched
          * items so nothing survives into the CSR cache.
          */
-        private fun filterResult(result: Any?): Any? = runCatching {
+        private fun filterResult(result: Any?, filter: FeedFilterEngine): Any? = runCatching {
             val items = extractFeedItemsFromResult(result) ?: return@runCatching null
-            val (kept, removed) = partitionSponsored(items)
-            if (removed <= 0) return@runCatching null
-            val rebuilt = rebuildFeedResult(result ?: return@runCatching null, kept)
+            val partition = filter.partition(items)
+            FeedFilterDiagnostics.batch(FeedPipeline.CSR_CACHE, partition)
+            if (partition.removed <= 0) return@runCatching null
+            val rebuilt = rebuildFeedResult(result ?: return@runCatching null, partition.kept)
                 ?: return@runCatching null
-            logHookHitThrottled("csrFilterOut", hookMethod) { "removed=$removed" }
+            logHookHitThrottled("csrFilterOut", hookMethod) {
+                "inspected=${partition.inspected} removed=${partition.removed} rules=${partition.removedByRule}"
+            }
             rebuilt
         }.getOrNull()
     }
@@ -849,26 +880,34 @@ object FeedGuardHook {
         private val listArgIndex: Int,
     ) : Hooker {
         override fun intercept(chain: XposedInterface.Chain): Any? {
-            if (!enabled()) return chain.proceed()
-            val newArgs = runCatching { filterListArg(chain) }.getOrNull()
+            FeedFilterDiagnostics.invoked(FeedPipeline.LATE_CACHE)
+            val filter = engine(FeedPipeline.LATE_CACHE)
+            if (!filter.active) return chain.proceed()
+            val newArgs = runCatching { filterListArg(chain, filter) }.getOrNull()
             return if (newArgs != null) chain.proceed(newArgs) else chain.proceed()
         }
 
-        private fun filterListArg(chain: XposedInterface.Chain): Array<Any?>? = runCatching {
+        private fun filterListArg(
+            chain: XposedInterface.Chain,
+            filter: FeedFilterEngine,
+        ): Array<Any?>? = runCatching {
             val original = chain.args.getOrNull(listArgIndex) as? Iterable<*> ?: return@runCatching null
-            val (kept, removed) = partitionSponsored(original)
-            if (removed <= 0) return@runCatching null
-            val rebuilt = buildImmutableListLike(chain.args[listArgIndex], kept) ?: return@runCatching null
+            val partition = filter.partition(original)
+            FeedFilterDiagnostics.batch(FeedPipeline.LATE_CACHE, partition)
+            if (partition.removed <= 0) return@runCatching null
+            val rebuilt = buildImmutableListLike(chain.args[listArgIndex], partition.kept) ?: return@runCatching null
             val newArgs: Array<Any?> = chain.args.toTypedArray()
             newArgs[listArgIndex] = rebuilt
-            logHookHitThrottled("lateFeedSanitize", hookMethod) { "removed=$removed" }
+            logHookHitThrottled("lateFeedSanitize", hookMethod) {
+                "inspected=${partition.inspected} removed=${partition.removed} rules=${partition.removedByRule}"
+            }
             newArgs
         }.getOrNull()
     }
 
     /**
      * Component guard: the owner is the component (or a wrapper whose child
-     * field holds it); when the component's edge is definitely sponsored,
+     * field holds it); when the component's edge matches any enabled rule,
      * null the render so Litho skips the row.
      */
     private class ComponentGuardHooker(
@@ -879,7 +918,9 @@ object FeedGuardHook {
         private val hookMethod: Method,
     ) : Hooker {
         override fun intercept(chain: XposedInterface.Chain): Any? {
-            if (!enabled()) return chain.proceed()
+            FeedFilterDiagnostics.invoked(FeedPipeline.LITHO_RENDER)
+            val filter = engine(FeedPipeline.LITHO_RENDER)
+            if (!filter.active) return chain.proceed()
             val owner = chain.thisObject ?: return chain.proceed()
             val component = when {
                 componentClass.isInstance(owner) -> owner
@@ -892,11 +933,19 @@ object FeedGuardHook {
                 logHookHitThrottled("feedComponentNoEdge", hookMethod) { "component=${componentClass.name}" }
                 return chain.proceed()
             }
-            if (!inspector().isDefinitelySponsoredFeedItem(edge)) {
+            val decision = filter.decide(edge)
+            FeedFilterDiagnostics.renderInspected(
+                decision,
+                Settings.getBoolean(Settings.FEED_AI_CONTENT, false),
+            )
+            if (!decision.remove) {
                 logHookHitThrottled("feedComponentPass", hookMethod) { "component=${componentClass.name}" }
                 return chain.proceed()
             }
-            logHookHitThrottled("feedComponentBlock", hookMethod) { inspector().describe(edge) }
+            FeedFilterDiagnostics.blocked(FeedPipeline.LITHO_RENDER, decision)
+            logHookHitThrottled("feedComponentBlock", hookMethod) {
+                "rule=${decision.ruleId} ${inspector().describe(edge)}"
+            }
             return null
         }
     }
@@ -904,16 +953,6 @@ object FeedGuardHook {
     // ------------------------------------------------------------------
     // List filtering helpers
     // ------------------------------------------------------------------
-
-    /** Splits a feed list into (kept items, sponsored-removed count). */
-    private fun partitionSponsored(items: Iterable<*>): Pair<List<Any?>, Int> {
-        val kept = ArrayList<Any?>()
-        var removed = 0
-        for (item in items) {
-            if (inspector().isDefinitelySponsoredFeedItem(item)) removed++ else kept.add(item)
-        }
-        return kept to removed
-    }
 
     /**
      * ImmutableList.copyOf through any classloader that can see the host's
@@ -1041,6 +1080,32 @@ object FeedGuardHook {
             val backendUnitClass: String?,
             val backendTypeName: String?,
         )
+
+        /** The same category signal used by the classic feed's category rules. */
+        fun categoryForFilter(value: Any?): String? {
+            if (value == null) return null
+            val model = invokeNoThrow(itemModelAccessor, value)
+            val edge = edgeFrom(value)
+            return readCategory(model) ?: readCategory(value) ?:
+                readEdgeCategory(edge) ?: readCategory(edge)
+        }
+
+        /** Cached rows often wrap the GraphQL edge in a storage-pool item. */
+        fun isAiContentFeedItem(value: Any?): Boolean {
+            if (value == null) return false
+            val edge = edgeFrom(value)
+            // A storage item can contain related stories, attachments and
+            // comments. Do not classify the whole wrapper before identifying
+            // the feed row's primary GraphQLFeedUnitEdge: that can hide an
+            // ordinary post merely because a *related* post used AI.
+            if (edge?.javaClass?.name == GRAPHQL_FEED_UNIT_EDGE_CLASS) {
+                return AiTransparencyInspector.isAiContent(edge)
+            }
+            // Unknown shapes fail open. The render adapter gets a second
+            // chance once Facebook has inflated the primary story.
+            return value.javaClass.name == "com.facebook.graphql.model.GraphQLStory" &&
+                AiTransparencyInspector.isAiContent(value)
+        }
 
         /**
          * The strict check the feed guard filters on: model/edge category

@@ -347,6 +347,15 @@ object BackgroundPlaybackHook {
     private fun onSeek(chain: XposedInterface.Chain): Any? {
         val requestedMs = (chain.args.getOrNull(1) as? Number)?.toInt() ?: return chain.proceed()
         if (!Settings.getBoolean(Settings.VIDEO_BACKGROUND, false)) return chain.proceed()
+        // The stale-position clamp was intended for the background transition,
+        // not for user scrubbing after Facebook becomes interactive again.
+        // An old arm within its 1600-ms window otherwise rewrites a backward
+        // seek and visibly snaps the user toward the previous video position.
+        if (startedActivities.get() > 0) {
+            armedVideoId = null
+            armedAt = 0L
+            return chain.proceed()
+        }
         // Never rewrite the restore arm's own seek (mod: the kRbFm hook marks
         // nlYTz state so the clamp stands down).
         if (VideoResumeHook.restoreInFlight) return chain.proceed()

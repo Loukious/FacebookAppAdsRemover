@@ -11,8 +11,8 @@ android {
         applicationId = "tn.loukious.facebookappadsremover"
         minSdk = 27
         targetSdk = 35
-        versionCode = 16
-        versionName = "1.15"
+        versionCode = 22
+        versionName = "1.21"
 
         testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"
     }
@@ -75,4 +75,6 @@ dependencies {
     // parser (libnc.so Rn0LbcxLisWuSI9YThk calls Jsoup.parse/Element.select/
     // Node.attr); bundling the same library keeps the port behavior-identical.
     implementation("org.jsoup:jsoup:1.17.2")
+
+    testImplementation("junit:junit:4.13.2")
 }

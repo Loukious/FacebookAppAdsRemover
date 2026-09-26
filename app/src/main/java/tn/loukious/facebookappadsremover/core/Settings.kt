@@ -37,7 +37,8 @@ object Settings {
 
     // Toggle keys + defaults, mirroring the original mod's switches:
     //   mod pref                              module key                      default
-    //   app.telegram.bemai3012_swHOME_ADS   → ads.enabled                     TRUE
+    //   app.telegram.bemai3012_swHOME_ADS   → ads.enabled (legacy, migrated
+    //                                        to newsFeed/stories/reels)       TRUE
     //   swHOME_THREADS                       → feed.threads                    FALSE
     //   swHOME_REELS                         → feed.reels                      FALSE
     //   swHOME_GOIY                          → feed.suggestions                FALSE
@@ -47,24 +48,22 @@ object Settings {
     //   privacy.disable_flag_secure          → privacy.allowCapture            FALSE
     //   privacy.capture_detection            → privacy.blockCaptureDetection   FALSE
     //   (download "use browser" setting)     → download.useBrowser             TRUE
-    //   swVIDEO_RESUME                       → media.video.resume              TRUE
+    //   swVIDEO_RESUME                       → media.video.resume              FALSE
     //   swBACKGROUND_PLAYBACK                → media.video.background          FALSE
 
-    /** Master ad-block switch — gates AdFilterHook, the sponsored feed
-     *  category and the ad-free-session spoof (mod: one swHOME_ADS switch). */
-    const val ADS_ENABLED = "ads.enabled"
+    /** Three independent ad surfaces. The old ads.enabled master is retained
+     *  only as a read/migration fallback, not a live gate for any hook. */
+    const val ADS_NEWS_FEED = "ads.newsFeed"
+    const val ADS_STORIES = "ads.stories"
+    const val ADS_REELS = "ads.reels"
+    internal const val LEGACY_ADS_ENABLED = "ads.enabled"
 
-    /** Per-family sub-switches for the ported ad guards. Each rides the
-     *  master [ADS_ENABLED] switch but can be turned off separately — e.g.
-     *  to disable one family without losing the rest of the ad blocking. */
+    /** Marketplace and in-app games remain independently switchable. */
     const val ADS_MARKETPLACE = "ads.marketplace"
     const val ADS_GAME_ADS = "ads.gameAds"
+    /** Advanced option: sponsored filter on CSR and late-cache feed paths.
+     * Does not disable non-ad categories, AI or keyword rules. */
     const val ADS_FEED_GUARD = "ads.feedGuard"
-
-    /** Reels "Shop now" shopping cards — the small shoppable product-card
-     *  banner overlaying a promotional reel (rendered by dedicated Litho
-     *  components, blocked at render time). */
-    const val ADS_REELS_SHOPPING = "ads.reelsShopping"
 
     const val FEED_THREADS = "feed.threads"
     const val FEED_REELS = "feed.reels"
@@ -72,10 +71,9 @@ object Settings {
     const val FEED_PYMK = "feed.pymk"
     const val FEED_STORIES = "feed.stories"
 
-    /** AI-content filter — drops stories whose gen-AI transparency info
-     *  carries the was_self_disclosed_as_ai_generated flag (our own feature;
-     *  the marker is TreeJNI hash -1133610173 on the transparency model that
-     *  GraphQLStory.A0Y()/C44g.A0u() expose). */
+    /** AI-content filter — drops stories whose GenAI transparency model marks
+     *  them as either self-disclosed or Meta-detected AI content. The matcher
+     *  uses stable GraphQL field hashes rather than obfuscated Java names. */
     const val FEED_AI_CONTENT = "feed.aiContent"
 
     /** Keyword filter master switch; the list itself is [FEED_KEYWORDS]. */
@@ -93,9 +91,8 @@ object Settings {
     const val PRIVACY_BLOCK_DETECTION = "privacy.blockCaptureDetection"
     const val DOWNLOAD_USE_BROWSER = "download.useBrowser"
 
-    /** Show the floating quick-download bubble when media is captured. The
-     *  downloader itself stays armed when this is off — only the overlay
-     *  icon is hidden (downloads then work via the copied-link trigger). */
+    /** Show contextual reel/story download actions. The downloader itself
+     *  stays armed when this is off; copied-link downloads still work. */
     const val DOWNLOAD_SHOW_ICON = "download.showIcon"
 
     /** Quick download via copied link — the clipboard trigger arm
@@ -105,6 +102,10 @@ object Settings {
     const val DOWNLOAD_CLIPBOARD = "download.clipboardTrigger"
 
     const val APPEARANCE_DARK = "appearance.dark"
+
+    /** Morphe-style AMOLED theme: keep Facebook's dark-mode semantics, but
+     * turn its dark neutral background palette into true black. */
+    const val APPEARANCE_AMOLED = "appearance.amoled"
 
     /** Clean URL — unwrap facebook.com/l.php?u=…&fbclid=… redirect links to
      *  the real destination when FB hands them to the browser (mod:
@@ -119,9 +120,17 @@ object Settings {
      *  (mod: navigation.activity_list.*). */
     const val NAVIGATION_ACTIVITY_LIST = "navigation.activityList"
 
-    /** Video resume — seek back to the saved position when a video is
-     *  re-opened (mod: swVIDEO_RESUME). Default TRUE: the mod's v879
-     *  per-video gate read (videoId, 1) — enabled unless turned off. */
+    /** Hide only the Home navigation bar destinations (top or bottom).
+     * Marketplace, Reels and Games remain accessible through menu, search,
+     * notifications, deep links and their original activities/routes. */
+    const val NAV_HIDE_REELS_TAB = "navigation.hideReelsTab"
+    const val NAV_HIDE_MARKETPLACE_TAB = "navigation.hideMarketplaceTab"
+    const val NAV_HIDE_GAMES_TAB = "navigation.hideGamesTab"
+
+    /** Opt-in video resume — restore a saved point ONCE when a video opens,
+     *  never force an already-playing video back after the user seeks. The
+     *  original mod defaulted this on; the port defaults it OFF for safety.
+     *  Explicit existing user preferences are not overwritten on upgrade. */
     const val VIDEO_RESUME = "media.video.resume"
 
     /** Background video playback — keep the tracked video playing while the
@@ -157,8 +166,41 @@ object Settings {
     }
 
     /** Reads a toggle; safe on hot paths and before [init]. */
-    fun getBoolean(key: String, default: Boolean): Boolean =
-        prefs?.let { runCatching { it.getBoolean(key, default) }.getOrDefault(default) } ?: default
+    fun getBoolean(key: String, default: Boolean): Boolean = prefs?.let { source ->
+        runCatching {
+            if (key in setOf(ADS_MARKETPLACE, ADS_GAME_ADS) &&
+                !source.getBoolean(AdSettingsMigration.MARKER, false) &&
+                source.contains(LEGACY_ADS_ENABLED) &&
+                !source.getBoolean(LEGACY_ADS_ENABLED, true)) {
+                // Before the module settings UI runs its one-time migration,
+                // the old master still overrides even an explicitly checked
+                // Marketplace/Game sub-switch. Preserve the old behavior.
+                false
+            } else if (source.contains(key)) source.getBoolean(key, default)
+            else if (key in LEGACY_AD_SURFACE_KEYS && source.contains(LEGACY_ADS_ENABLED)) {
+                // On first launch after the split, the UI may not have run its
+                // migration yet. Preserve a disabled old master until the
+                // corresponding explicit new preference is written.
+                source.getBoolean(LEGACY_ADS_ENABLED, default)
+            } else default
+        }.getOrDefault(default)
+    } ?: default
+
+    private val LEGACY_AD_SURFACE_KEYS = setOf(
+        ADS_NEWS_FEED, ADS_STORIES, ADS_REELS, ADS_MARKETPLACE, ADS_GAME_ADS,
+    )
+
+    /** Shared ad fetchers cannot be assigned safely to one surface; blocking
+     * them only when *every* affected surface is enabled preserves off toggles.
+     */
+    fun blockAdsOn(surfaces: Set<AdSurface>): Boolean =
+        AdSurfacePolicy.shouldBlock(surfaces) { surface ->
+            getBoolean(when (surface) {
+                AdSurface.NEWS_FEED -> ADS_NEWS_FEED
+                AdSurface.STORIES -> ADS_STORIES
+                AdSurface.REELS -> ADS_REELS
+            }, true)
+        }
 
     /** Reads a string setting (e.g. the keyword list); safe before [init]. */
     fun getString(key: String, default: String): String =

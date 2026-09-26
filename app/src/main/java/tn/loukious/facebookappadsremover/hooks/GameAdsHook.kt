@@ -277,8 +277,7 @@ object GameAdsHook {
      * re-install.
      */
     private fun enabled(): Boolean =
-        Settings.getBoolean(Settings.ADS_ENABLED, true) &&
-            Settings.getBoolean(Settings.ADS_GAME_ADS, true)
+        Settings.getBoolean(Settings.ADS_GAME_ADS, true)
 
     // ------------------------------------------------------------------
     // Entry points

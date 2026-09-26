@@ -53,11 +53,9 @@ import java.util.concurrent.Executors
  *  - Dialog (pO4Tj): page section (radio rows + reload) followed by Title /
  *    Content / Comment inputs; the comment EditText is pre-filled from
  *    saved_comment, and Post re-saves it before dispatching.
- *  - Result screen (pO4Tj.s9sEFa2Cpw9OaL6Yf67 — a JAVA method, fully read
- *    from the mod's dex): "Page: <name>\n<ID>\n\nVideo ID / Title / Content
- *    / Source VideoId / [Source URL] / Video URL / [Comment] / [Comment ID]
- *    / [Comment status]", blank fields omitted like the mod's optString
- *    chains.
+ *  - Result reporting: unlike the original mod's verbose result dialog, this
+ *    port reports completion with a Toast. The Page picker/editor is kept;
+ *    only the final success/failure surface is simplified.
  *
  * Deviations (documented): English labels instead of the mod's Vietnamese
  * string table; the port already holds direct video URLs in VideoData, so
@@ -110,7 +108,7 @@ object Repost {
         val displayName: String get() = name.ifBlank { id }
     }
 
-    /** Everything the Post flow produces, for the result screen. */
+    /** Everything the Post flow produces, used to choose the completion Toast. */
     class PostOutcome(
         val videoId: String,
         val commentId: String,
@@ -322,9 +320,10 @@ object Repost {
         private lateinit var commentInput: EditText
         private lateinit var dialog: AlertDialog
 
-        /** The best captured rendition — the mod resolves this via graphql;
-         *  the port already has the URLs (see class KDoc). */
-        private val videoUrl: String? = bestVideoUrl(video)
+        /** Best muxed rendition when available, otherwise the best video-only
+         *  rendition (for legitimately silent/split-only source media). */
+        private val selectedVideo = bestVideoQuality(video)
+        private val videoUrl: String? = selectedVideo?.url
 
         fun show() {
             val root = LinearLayout(activity).apply {
@@ -525,8 +524,8 @@ object Repost {
             val content = contentInput.text?.toString()?.trim().orEmpty().ifBlank { title }
             val comment = commentInput.text?.toString()?.trim().orEmpty()
             if (videoUrl.isNullOrBlank()) {
-                // Mod: item.video.repost.video_url_error
-                Toast.makeText(activity, "No video URL available", Toast.LENGTH_SHORT).show()
+                Toast.makeText(activity, "No video URL available",
+                    Toast.LENGTH_SHORT).show()
                 return
             }
             // Mod: saved_comment persists the comment text across uses.
@@ -534,25 +533,31 @@ object Repost {
 
             // Mod: "Đang đăng video lên Page: <name>" (libnc.so.c 40156) in
             // the dialog while the workers run; the port dismisses and
-            // reports via the result dialog.
+            // reports completion with a Toast.
             dialog.dismiss()
             Toast.makeText(activity, "Posting video to Page: ${page.displayName}",
                 Toast.LENGTH_SHORT).show()
-            L.i(TAG, "posting videoId=${video.videoId} to page=${page.id}")
+            L.i(TAG, "posting videoId=${video.videoId} quality=${selectedVideo?.label} " +
+                "tag=${selectedVideo?.tag} to page=${page.id}")
             io.execute {
                 val outcome = runCatching { postVideoAndComment(page, videoUrl!!, title, content, comment) }
                 main.post {
                     outcome.onSuccess {
                         L.i(TAG, "post complete: videoId=${it.videoId} " +
                                 "comment=${it.commentPosted} commentId=${it.commentId}")
-                        showResult(page, title, content, comment, it)
+                        val message = if (comment.isNotBlank() && !it.commentPosted) {
+                            "Reposted to ${page.displayName}, but comment failed."
+                        } else {
+                            "Reposted successfully to ${page.displayName}."
+                        }
+                        Toast.makeText(activity, message, Toast.LENGTH_LONG).show()
                     }.onFailure {
                         L.w(TAG, "post failed", it)
-                        AlertDialog.Builder(activity)
-                            .setTitle("Repost Facebook Video")
-                            .setMessage("Post failed: ${it.message ?: it.javaClass.simpleName}")
-                            .setPositiveButton(android.R.string.ok, null)
-                            .show()
+                        Toast.makeText(
+                            activity,
+                            "Repost failed: ${it.message ?: it.javaClass.simpleName}",
+                            Toast.LENGTH_LONG,
+                        ).show()
                     }
                 }
             }
@@ -566,8 +571,8 @@ object Repost {
          * VideoData, so the mod's watch-page scrape and alternate engine
          * never come into play — this starts at the Graph calls.
          *
-         * A comment failure does NOT throw: the mod surfaces it as a
-         * failed status in the result dialog while the video stays posted.
+         * A comment failure does NOT throw: the video is already posted, so
+         * completion reports that partial failure via Toast.
          */
         @Throws(Exception::class)
         private fun postVideoAndComment(
@@ -588,8 +593,7 @@ object Repost {
             val videoId = JSONObject(videoBody).getString("id")
             L.i(TAG, "video posted: id=$videoId")
 
-            // No comment → straight to the result dialog (mod: the outer
-            // runnable's blank-comment branch).
+            // No comment → posting is complete.
             if (comment.isBlank()) return PostOutcome(videoId, "", false, null)
 
             // Mod: Handler().postDelayed(r, 500) — give Facebook a moment to
@@ -604,86 +608,45 @@ object Repost {
                 L.i(TAG, "comment posted: id=$commentId")
                 PostOutcome(videoId, commentId, true, null)
             } catch (e: Exception) {
-                // Mod: comment_error + result dialog with the failure detail.
+                // The video is already posted; preserve that distinction in
+                // the completion Toast instead of treating the whole repost
+                // as failed.
                 L.w(TAG, "comment post failed: ${e.message}")
                 PostOutcome(videoId, "", false, e.message)
             }
-        }
-
-        /**
-         * pO4Tj.s9sEFa2Cpw9OaL6Yf67 port — the result screen (a JAVA method
-         * in the mod, read straight from its dex). Blank fields are omitted,
-         * exactly like the mod's optString chains.
-         */
-        private fun showResult(
-            page: Page, title: String, content: String, comment: String,
-            outcome: PostOutcome,
-        ) {
-            val sb = StringBuilder()
-            sb.append("Page: ").append(page.displayName).append('\n')
-            sb.append(page.id).append("\n\n")
-            sb.append("Video ID: ").append(outcome.videoId).append('\n')
-            if (title.isNotBlank()) sb.append("Title: ").append(title).append('\n')
-            if (content.isNotBlank()) sb.append("Content: ").append(content).append('\n')
-            sb.append("Source VideoId: ").append(video.videoId).append('\n')
-            if (video.postUrl.isNotBlank()) sb.append("Source URL: ").append(video.postUrl).append('\n')
-            sb.append("Video URL: ").append(videoUrl).append('\n')
-            if (comment.isBlank()) {
-                // Mod: item.video.repost.result.comment.none
-                sb.append('\n').append("Comment: none").append('\n')
-            } else {
-                sb.append('\n').append("Comment: ").append(comment).append('\n')
-                if (outcome.commentId.isNotBlank()) {
-                    sb.append("Comment ID: ").append(outcome.commentId).append('\n')
-                }
-                sb.append("Comment status: ").append(
-                    if (outcome.commentPosted) "posted"  // mod: comment_success
-                    else "failed: ${outcome.commentError ?: "unknown error"}"
-                ).append('\n')
-            }
-            val text = TextView(activity).apply {
-                text = sb
-                textSize = 13f
-                setPadding(dp(20), dp(16), dp(20), dp(8))
-            }
-            AlertDialog.Builder(activity)
-                .setTitle("Repost Result")  // mod: OwqRIU.Rn0LbcxLisWuSI9YThk(…, "Repost Result")
-                .setView(ScrollView(activity).apply { addView(text) })
-                .setPositiveButton(android.R.string.ok, null)
-                .show()
         }
     }
 
     /**
      * The best captured video URL, by the same ladder the card summary uses:
-     * playlist renditions by height/qualityLabel first, then the HD/SD
-     * quality ladder, then any captured URL. SD-tagged progressive URLs are
-     * rejected up front (mod: the htPRWBO0d2x0vEhcy0k chooser skips any
-     * candidate whose lowercase form contains "tag=sve_sd", "tag=sd" or
-     * "sve_sd" — libnc.so.c 1318030).
+     * Page repost is different from download: Graph's `file_url` accepts one
+     * URL, while every embedded playlist rendition is a video-only DASH
+     * track. Prefer the highest-quality captured progressive/muxed MP4 and
+     * only fall back to a split video track when there is no muxed candidate
+     * at all (which also covers genuinely silent source videos).
      */
     internal fun bestVideoUrl(video: DownloadHook.VideoData): String? {
-        // Preference-ordered candidates: playlist renditions by height /
-        // qualityLabel descending, then the HD/SD ladder (HD first), then
-        // everything else.
-        val candidates = ArrayList<String>()
-        (video.playlist?.videos ?: emptyList()).sortedByDescending {
-            it.qualityLabel.filter { c -> c.isDigit() }.toIntOrNull()
-                ?: it.height.toIntOrNull() ?: 0
-        }.forEach { candidates.add(it.baseUrl) }
-        video.qualities
-            .sortedByDescending { it.label.contains("HD", true) }
-            .forEach { candidates.add(it.url) }
-        // Mod chooser: the first candidate free of SD tags.
-        candidates.firstOrNull(::isNonSdUrl)?.let { return it }
-        // Port fallback: everything is SD-tagged — post the best one rather
-        // than failing (the mod would route to its alternate engine).
-        return candidates.firstOrNull()
+        return bestVideoQuality(video)?.url
     }
 
-    /** The htPRWBO0d2x0vEhcy0k SD-tag rejection (libnc.so.c 1318030). */
-    private fun isNonSdUrl(url: String): Boolean {
-        val l = url.lowercase()
-        return !l.contains("tag=sve_sd") && !l.contains("tag=sd") && !l.contains("sve_sd")
+    private fun bestVideoQuality(video: DownloadHook.VideoData): RepostMediaSelector.Candidate? {
+        val candidates = ArrayList<RepostMediaSelector.Candidate>()
+        video.qualities.forEach {
+            candidates += RepostMediaSelector.Candidate(it.label, it.url, it.tag)
+        }
+        // Embedded MPD representations are explicitly video-only. They are
+        // lower priority than every muxed candidate, but they must still be
+        // available for genuinely silent / split-only source media.
+        video.playlist?.videos.orEmpty().forEach { rendition ->
+            val label = rendition.qualityLabel.ifBlank {
+                rendition.height.takeIf { it.isNotBlank() }?.let { "${it}p" } ?: "DASH video"
+            }
+            candidates += RepostMediaSelector.Candidate(
+                label = label,
+                url = rendition.baseUrl,
+                tag = "mp4_no_audio",
+            )
+        }
+        return RepostMediaSelector.best(candidates)
     }
 }

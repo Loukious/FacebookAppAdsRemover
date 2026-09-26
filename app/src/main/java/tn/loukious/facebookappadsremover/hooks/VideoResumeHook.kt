@@ -44,12 +44,14 @@ import java.util.WeakHashMap
  * Mod hooks on the player class:
  *
  *   maybeTrackVideoStart(reason) — AFTER hook: extract videoId + position,
- *       track the player in a WeakReference, then ARM the restore (nMXy:
+ *       track the player in a WeakReference, then ARM the restore ONCE (nMXy:
  *       saved pos ≥ 1001 ms, deadline now+3000 ms, postDelayed 900 ms) when
  *       a stored position exists.
  *   maybeTrackVideoStop(reason) — BEFORE hook: tracked == this → save the
  *       current position to the store, clear tracking.
- *   seek(reason, int) — BEFORE hook (prio 10000): observes FB's own seeks.
+ *   seek(reason, int) — BEFORE hook (prio 10000): cancel pending restore;
+ *       AFTER successful FB seek: update the saved point, including clearing
+ *       an old point when the user scrubs to the beginning.
  *       Does NOT rewrite args (correction from the session-10 decode) — it
  *       marks state so the restore doesn't fight the player.
  *   Activity.onPause/onStop → FgOJ lifecycle save (min position 1000 ms).
@@ -98,8 +100,19 @@ object VideoResumeHook {
     /** Mod: nMXy posts wi6Jf with postDelayed(…, 900). */
     private const val RESTORE_DELAY_MS = 900L
 
+    /** Very short clips can pass their saved point before a 900-ms callback. */
+    private const val SHORT_RESTORE_LIMIT_MS = 10_000L
+    private const val SHORT_RESTORE_DELAY_MS = 200L
+    private const val SHORT_MIN_ADVANCE_MS = 250L
+
+    /** A no-op startup seek from Facebook must not look like user scrubbing. */
+    private const val STARTUP_SEEK_WINDOW_MS = 1_250L
+
     /** Mod: restore deadline = elapsedRealtime() + 3000 (nMXy). */
     private const val RESTORE_DEADLINE_MS = 3000L
+
+    /** A seek followed by FB's tracking stop/start is not a new playback. */
+    private const val SCRUB_RESTART_COOLDOWN_MS = 5000L
 
     private val main = Handler(Looper.getMainLooper())
 
@@ -122,13 +135,13 @@ object VideoResumeHook {
     /** Mod: x0g6F4hC2D0POfsNAQAh — per-player restore state, attached via
      *  setAdditionalInstanceField; the port keys a WeakHashMap by player. */
     private class RestoreState(val videoId: String) {
-        @Volatile var targetMs = 0L       // x0g6.s9sE (long)
-        @Volatile var deadlineAt = 0L     // x0g6 deadline (elapsedRealtime + 3000)
-        @Volatile var pending = false     // s9sEFa2Cpw9OaL6Yf67 boolean ("mark pending")
-        @Volatile var inFlight = false    // yhNqDcnFVKtPAnsZdXH ("restore in flight")
+        val gate = VideoRestoreGate()
     }
 
     private val restoreStates = java.util.Collections.synchronizedMap(WeakHashMap<Any, RestoreState>())
+
+    /** One restore per actual video visit, not per stop/start of a pooled Reel. */
+    private val restoreVisits = VideoRestoreVisitGate()
 
     /** Read by BackgroundPlaybackHook so the stale-seek clamp never rewrites
      *  the restore arm's own seek (mod: the kRbFm hook marks nlYTz state).
@@ -370,6 +383,21 @@ object VideoResumeHook {
     class VideoInfo(val videoId: String, val paramInt: Int, val positionMs: Int)
 
     /**
+     * Reads only the player's media id. The contextual downloader needs this
+     * even when resume-position is disabled, so it must not depend on the
+     * position getter or the resume preference.
+     */
+    fun extractVideoId(player: Any?): String? {
+        val pm = paramsMethod ?: return null
+        if (player == null) return null
+        return runCatching {
+            val params = pm.invoke(player) ?: return null
+            params.toString().removePrefix(VIDEO_ID_MARKER)
+                .takeIf { it.isNotEmpty() && it != "null" }
+        }.getOrNull()
+    }
+
+    /**
      * JAvH7JcvC2m10XLQTVY port: params getter → toString() → videoId,
      * position getter → current position. Returns null when any member is
      * missing or the videoId is empty — callers treat that as "not a tracked
@@ -377,13 +405,9 @@ object VideoResumeHook {
      * <id>") — the String field itself rotates per build.
      */
     fun extractInfo(player: Any?): VideoInfo? {
-        val pm = paramsMethod ?: return null
         val pos = positionMethod ?: return null
-        if (player == null) return null
+        val videoId = extractVideoId(player) ?: return null
         return runCatching {
-            val params = pm.invoke(player) ?: return null
-            val videoId = params.toString().removePrefix(VIDEO_ID_MARKER)
-                .takeIf { it.isNotEmpty() && it != "null" } ?: return null
             VideoInfo(videoId, 0, (pos.invoke(player) as Number).toInt())
         }.getOrNull()
     }
@@ -413,9 +437,23 @@ object VideoResumeHook {
                     chain.proceed()
                 }
                 seekMethod -> {
-                    runCatching { onPlayerSeek(chain.thisObject, chain.args.getOrNull(1)) }
+                    // Cancel the pending jump BEFORE Facebook processes the
+                    // user's seek: seeking can synchronously issue another
+                    // maybeTrackVideoStart and must not re-arm restoration.
+                    val observation = runCatching { onPlayerSeek(
+                        chain.thisObject, chain.args.getOrNull(0), chain.args.getOrNull(1)
+                    ) }
                         .onFailure { L.w(TAG, "seek observation failed", it) }
-                    chain.proceed()
+                        .getOrNull()
+                    val result = chain.proceed()
+                    // Don't record a seek as saved progress if FB rejected it.
+                    observation?.let { (videoId, requestedMs) ->
+                        restoreStates[chain.thisObject]?.takeIf { it.videoId == videoId }
+                            ?.gate?.recordAppliedSeek(requestedMs, SystemClock.elapsedRealtime())
+                        if (requestedMs >= 1000) ResumeStore.put(videoId, requestedMs.toLong())
+                        else ResumeStore.remove(videoId)
+                    }
+                    result
                 }
                 else -> chain.proceed()
             }
@@ -425,11 +463,29 @@ object VideoResumeHook {
     /** bsrnc after-hook (maybeTrackVideoStart) + nMXy/QnHm arms. */
     private fun onVideoStart(player: Any?, reason: Any?) {
         if (player == null) return
-        if (!Settings.getBoolean(Settings.VIDEO_RESUME, true)) return
-        val info = extractInfo(player) ?: return
+        DownloadHook.onPlaybackStarted(extractVideoId(player))
+        // BackgroundPlaybackHook and the contextual downloader need current
+        // player tracking even when resume itself defaults OFF.
         trackedRef = WeakReference(player)
-        val state = RestoreState(info.videoId)
-        restoreStates[player] = state
+        if (!Settings.getBoolean(Settings.VIDEO_RESUME, false)) return
+        val info = extractInfo(player) ?: return
+        val now = SystemClock.elapsedRealtime()
+        restoreVisits.observeStart(info.videoId, now)
+        val (state, newSession) = synchronized(restoreStates) {
+            val previous = restoreStates[player]
+            if (previous != null && previous.videoId == info.videoId &&
+                !previous.gate.mayBeginNewSession(now, SCRUB_RESTART_COOLDOWN_MS)) {
+                previous to false
+            } else {
+                RestoreState(info.videoId).also { restoreStates[player] = it } to true
+            }
+        }
+        if (!newSession) {
+            L.i(TAG, "start reused state for ${info.videoId} " +
+                    "(reason=$reason savedMs=${ResumeStore.get(info.videoId)?.positionMs} " +
+                    "currentMs=${info.positionMs})")
+            return // Rebuffer/repeated start, not a new video.
+        }
 
         // QnHm store-refresh: the same video restarted within 5 s keeps its
         // entry (re-save with a fresh timestamp) instead of resetting it.
@@ -439,26 +495,39 @@ object VideoResumeHook {
 
         // nMXy arm: saved position ≥ 1001 ms → arm target + deadline, post
         // the restore decision runnable after 900 ms.
-        val saved = ResumeStore.get(info.videoId) ?: return
-        val target = saved.positionMs.coerceAtLeast(0L)
-        if (target < 1001L) return
-        state.targetMs = target
-        state.deadlineAt = SystemClock.elapsedRealtime() + RESTORE_DEADLINE_MS
-        main.postDelayed(RestoreRunnable(player, state, reason, info.videoId), RESTORE_DELAY_MS)
-        L.i(TAG, "armed restore for ${info.videoId} at ${target}ms (deadline +${RESTORE_DEADLINE_MS}ms)")
+        val target = ResumeStore.get(info.videoId)?.positionMs
+        if (!state.gate.armOnce(target, now, RESTORE_DEADLINE_MS)) {
+            L.i(TAG, "start has no saved point for ${info.videoId} (reason=$reason)")
+            return
+        }
+        val isShort = target != null && target <= SHORT_RESTORE_LIMIT_MS
+        val delayMs = if (isShort) SHORT_RESTORE_DELAY_MS else RESTORE_DELAY_MS
+        main.postDelayed(RestoreRunnable(player, state, reason, info.videoId, isShort), delayMs)
+        L.i(TAG, "armed restore for ${info.videoId} at ${target}ms " +
+                "(delay=${delayMs}ms, deadline +${RESTORE_DEADLINE_MS}ms)")
     }
 
     /** Hk8o before-hook (maybeTrackVideoStop): tracked == this → save. */
     private fun onVideoStop(player: Any?) {
-        if (!Settings.getBoolean(Settings.VIDEO_RESUME, true)) return
+        DownloadHook.onPlaybackStopped(extractVideoId(player))
+        // Pooled Reels may stop a player after tracking moved to another one.
+        // Its pending restore still must be invalidated, even if we must not
+        // save the off-screen player as the current video.
+        player?.let { restoreStates[it] }?.gate?.markStopped()
         if (trackedRef?.get() !== player) return
-        val info = extractInfo(player) ?: return
-        // qsJG/EQRQ clamp: never save a position under 1000 ms.
-        if (info.positionMs >= 1000) {
-            ResumeStore.put(info.videoId, info.positionMs.toLong())
-            L.i(TAG, "saved ${info.videoId} at ${info.positionMs}ms (mod log: stop-hook)")
-        }
+        // Always stop tracking, even with resume OFF, to avoid keeping stale
+        // BackgroundPlaybackHook state when the user switches videos.
         trackedRef = null
+        if (!Settings.getBoolean(Settings.VIDEO_RESUME, false)) return
+        val state = player?.let { restoreStates[it] }
+        val info = extractInfo(player) ?: return
+        val savedMs = state?.gate?.positionToSave(
+            info.positionMs, SystemClock.elapsedRealtime()) ?: info.positionMs
+        // qsJG/EQRQ clamp: never save a position under 1000 ms.
+        if (savedMs >= 1000) {
+            ResumeStore.put(info.videoId, savedMs.toLong())
+            L.i(TAG, "saved ${info.videoId} at ${savedMs}ms (mod log: stop-hook)")
+        }
     }
 
     /**
@@ -467,26 +536,47 @@ object VideoResumeHook {
      * so the two features don't fight; the port disarms the restore state
      * and records the sought position so the next save uses it.
      */
-    private fun onPlayerSeek(player: Any?, requested: Any?) {
-        val state = player?.let { restoreStates[it] } ?: return
-        if (state.inFlight) return  // our own restore seek (Rn0 guard)
-        val requestedMs = (requested as? Number)?.toInt() ?: return
-        state.targetMs = 0L
-        state.deadlineAt = 0L
-        if (requestedMs >= 1000) {
-            ResumeStore.put(state.videoId, requestedMs.toLong())
+    private fun onPlayerSeek(player: Any?, reason: Any?, requested: Any?): Pair<String, Int>? {
+        if (!Settings.getBoolean(Settings.VIDEO_RESUME, false)) return null
+        val state = player?.let { restoreStates[it] } ?: return null
+        val requestedMs = (requested as? Number)?.toInt() ?: return null
+        val now = SystemClock.elapsedRealtime()
+        val reasonName = (reason as? Enum<*>)?.name ?: reason?.toString()
+        val currentMs = runCatching { (positionMethod?.invoke(player) as? Number)?.toInt() }.getOrNull()
+        if (!VideoSeekPolicy.shouldObserveAsUserSeek(
+                reasonName, requestedMs, currentMs,
+                state.gate.wasJustStarted(now, STARTUP_SEEK_WINDOW_MS))) {
+            // FB580's Shorts viewer pauses an offscreen Reel and issues
+            // EeY(BY_SHORT_FORM_VIDEO_INVISIBLE, 0). Its position must be
+            // recorded *before* that internal reset. Never confuse it with
+            // the user's deliberate rewind-to-zero, which clears the store.
+            if (VideoSeekPolicy.isAutomaticReset(reasonName, requestedMs, currentMs) &&
+                extractVideoId(player) == state.videoId && currentMs != null) {
+                val savedMs = state.gate.positionToSave(currentMs, now)
+                if (savedMs >= 1000) ResumeStore.put(state.videoId, savedMs.toLong())
+                state.gate.recordAutomaticReset(savedMs, now)
+            }
+            L.i(TAG, "ignored FB internal seek for ${state.videoId}: reason=$reasonName " +
+                    "requestedMs=$requestedMs currentMs=$currentMs")
+            return null
         }
+        if (!state.gate.cancelForSeek(now)) return null
+        L.i(TAG, "user/FB seek canceled pending restore for ${state.videoId}: " +
+                "reason=$reasonName requestedMs=$requestedMs currentMs=$currentMs")
+        return state.videoId to requestedMs
     }
 
     /** FgOJykHvmRjW8PKecX8 port: lifecycle save with the 1000 ms clamp. */
     private fun onLifecycleSave(event: String) {
-        if (!Settings.getBoolean(Settings.VIDEO_RESUME, true)) return
+        if (!Settings.getBoolean(Settings.VIDEO_RESUME, false)) return
         val player = trackedRef?.get() ?: return
         runCatching {
             val info = extractInfo(player) ?: return
-            if (info.positionMs >= 1000) {
-                ResumeStore.put(info.videoId, info.positionMs.toLong())
-                L.i(TAG, "SAVE_$event ${info.videoId} at ${info.positionMs}ms")
+            val savedMs = restoreStates[player]?.gate?.positionToSave(
+                info.positionMs, SystemClock.elapsedRealtime()) ?: info.positionMs
+            if (savedMs >= 1000) {
+                ResumeStore.put(info.videoId, savedMs.toLong())
+                L.i(TAG, "SAVE_$event ${info.videoId} at ${savedMs}ms")
             }
         }.onFailure { L.w(TAG, "SAVE_${event}_FAILED", it) }
     }
@@ -503,41 +593,54 @@ object VideoResumeHook {
         private val state: RestoreState,
         private val reason: Any?,
         private val videoId: String,
+        private val shortPosition: Boolean,
     ) : Runnable {
         override fun run() {
-            state.pending = true  // wi6Jf step 1: mark pending
             try {
-                val info = extractInfo(player) ?: return
-                // Step 3: the video on screen must still be the armed one.
-                if (info.videoId != videoId) return
-                // Step 4: target window — under 1001 ms disarms outright.
-                if (state.targetMs < 1001L) {
-                    state.targetMs = 0L
+                if (!Settings.getBoolean(Settings.VIDEO_RESUME, false)) return
+                if (restoreStates[player] !== state || trackedRef?.get() !== player) {
+                    L.i(TAG, "restore skipped $videoId: player/state no longer current")
                     return
                 }
-                if (state.targetMs < 1501L) return  // final gate (0x5dd)
-                if (SystemClock.elapsedRealtime() > state.deadlineAt) return
-                // Deviation note (see class KDoc): the undecoded delta gate —
-                // bail when the player is already within 1000 ms of target.
-                if (state.targetMs - info.positionMs <= 1000L) return
+                val info = extractInfo(player) ?: run {
+                    L.i(TAG, "restore skipped $videoId: no video info")
+                    return
+                }
+                // Step 3: the video on screen must still be the armed one.
+                if (info.videoId != videoId) {
+                    L.i(TAG, "restore skipped $videoId: player now has ${info.videoId}")
+                    return
+                }
+                val now = SystemClock.elapsedRealtime()
+                if (!restoreVisits.mayRestore(videoId, now)) {
+                    L.i(TAG, "restore skipped $videoId: already restored this visit")
+                    return
+                }
+                val target = state.gate.consumeIfValid(
+                    now, info.positionMs,
+                    if (shortPosition) SHORT_MIN_ADVANCE_MS else 1000L) ?: run {
+                    L.i(TAG, "restore skipped $videoId: gate rejected at ${info.positionMs}ms")
+                    return
+                }
 
                 // Rn0LbcxLisWuSI9YThk: the seek executor.
-                state.inFlight = true
                 restoreInFlightCount.incrementAndGet()
                 try {
                     val seek = seekMethodFor(player) ?: return
-                    seek.invoke(player, reason, state.targetMs.toInt())
-                    L.i(TAG, "restored $videoId to ${state.targetMs}ms")
+                    if (!restoreVisits.markRestore(videoId, SystemClock.elapsedRealtime())) {
+                        L.i(TAG, "restore skipped $videoId: visit already consumed")
+                        return
+                    }
+                    seek.invoke(player, reason, target.toInt())
+                    L.i(TAG, "restored $videoId to ${target}ms (one-shot)")
                 } catch (t: Throwable) {
                     L.w(TAG, "restore seek failed for $videoId", t)
                 } finally {
                     restoreInFlightCount.decrementAndGet()
-                    state.inFlight = false
+                    state.gate.finishRestore()
                 }
             } catch (t: Throwable) {
                 L.w(TAG, "restore decision failed for $videoId", t)
-            } finally {
-                state.pending = false
             }
         }
     }

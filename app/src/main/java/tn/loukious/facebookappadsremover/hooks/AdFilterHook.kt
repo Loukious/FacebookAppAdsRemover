@@ -4,6 +4,9 @@ import android.content.Context
 import android.os.Build
 import tn.loukious.facebookappadsremover.BuildConfig
 import tn.loukious.facebookappadsremover.core.AdTargets
+import tn.loukious.facebookappadsremover.core.AdSurface
+import tn.loukious.facebookappadsremover.core.AdSurfacePolicy
+import tn.loukious.facebookappadsremover.core.BannerClassCacheEntry
 import tn.loukious.facebookappadsremover.core.HookAction
 import tn.loukious.facebookappadsremover.core.HookTarget
 import tn.loukious.facebookappadsremover.core.L
@@ -46,6 +49,8 @@ object AdFilterHook {
     /** Banner-scan class cache — internal state, kept in the FB process. */
     private const val BANNER_CACHE_NAME = "fbar_prefs_banner"
     private const val KEY_BANNER_CLASSES = "cached_banner_classes"
+    private const val KEY_BANNER_SCHEMA = "cached_banner_schema"
+    private const val BANNER_SCHEMA = 2 // Class + surface provenance (not bare names).
 
     /**
      * Version stamps for the banner class cache.
@@ -58,10 +63,9 @@ object AdFilterHook {
      * the cache was written once and then only ever read, so nothing could
      * revise it — that is [KEY_BANNER_MODULE_VERSION].
      *
-     * Either stamp moving marks the cache stale. A stale cache is rebuilt only
-     * when a DexKit bridge is available on that launch; otherwise the old names
-     * are swept as-is and the stamps are left stale, so the rebuild lands on the
-     * next bridge-available launch instead of being skipped forever.
+     * Version/schema changes trigger a new scan. Never reuse old bare class
+     * names without their feed/story/Reels origin: that bypasses the user's
+     * independent ad toggles even if the class happens to load successfully.
      */
     private const val KEY_BANNER_HOST_VERSION = "cached_banner_host_version"
     private const val KEY_BANNER_MODULE_VERSION = "cached_banner_module_version"
@@ -75,7 +79,7 @@ object AdFilterHook {
      * ad-related ones such as `libmailboxinthreadadcontextbannerjni.so`. So
      * SoLoader *references* the `mailboxinthreadadcontextbannerjni` banner
      * anchor, and its `loadLibrary` / `loadLibraryUnsafe` overloads return
-     * boolean, so the banner sweep below swept them. `BlockFalseHook` never
+     * boolean, so the banner sweep below swept them. The false-return hook never
      * calls the original, so no merged library ever had its `JNI_OnLoad`
      * invoked: every `initHybrid` threw UnsatisfiedLinkError and Facebook could
      * not start at all (reported 2026-09-16; reproduced on 578.0.0.40.75 by
@@ -109,67 +113,90 @@ object AdFilterHook {
     @Volatile
     internal var appClassLoader: ClassLoader? = null
 
-    /**
-     * Master toggle (mod: app.telegram.bemai3012_swHOME_ADS, default TRUE).
-     * Re-read on each hook invocation, like the mod did — the settings UI
-     * (core.Settings remote preferences) can flip it between invocations.
-     */
-    private fun enabled(): Boolean = Settings.getBoolean(Settings.ADS_ENABLED, true)
+    /** Read per-surface prefs for every invocation (live settings changes). */
+    private fun enabled(surfaces: Set<AdSurface>): Boolean = Settings.blockAdsOn(surfaces)
 
     fun init(context: Context) {
         appClassLoader = context.classLoader
-        L.i(TAG, "Ad filter enabled=${enabled()}")
+        L.i(TAG, "Ad filters: newsFeed=${Settings.blockAdsOn(setOf(AdSurface.NEWS_FEED))} " +
+            "stories=${Settings.blockAdsOn(setOf(AdSurface.STORIES))} " +
+            "reels=${Settings.blockAdsOn(setOf(AdSurface.REELS))}")
     }
 
     /** Installs every resolved method target from the discovery report. */
     fun install(module: XposedInterface, targets: List<HookTarget>, methods: Map<String, List<Method>>) {
-        var installed = 0
+        // An obfuscated method can match multiple semantic anchors. Intercept
+        // it only once and require ALL affected surfaces to be enabled so an
+        // off toggle is never bypassed by another anchor on the same method.
+        val resolved = LinkedHashMap<Method, Pair<HookAction, Set<AdSurface>>>()
+        val ambiguous = HashSet<Method>()
         for (target in targets) {
             val action = target.action ?: continue
+            val surfaces = AdSurfacePolicy.targetSurfaces(target.key)
+            if (surfaces.isNullOrEmpty()) {
+                L.w(TAG, "Unclassified ad target: ${target.key}; skipping")
+                continue
+            }
             for (m in methods[target.key].orEmpty()) {
+                val existing = resolved[m]
+                if (existing == null) resolved[m] = action to surfaces
+                else if (existing.first != action) {
+                    ambiguous.add(m)
+                    L.w(TAG, "Conflicting ad actions for ${m.declaringClass.name}.${m.name}; refusing")
+                } else resolved[m] = action to (existing.second + surfaces)
+            }
+        }
+        var installed = 0
+        for ((m, binding) in resolved) {
+                if (m in ambiguous) continue
+                val (action, surfaces) = binding
                 // R8 centralizes string constants into dispatch tables —
                 // `static String xxx(int)` with a giant switch. Anchor strings
                 // then resolve to the TABLE, not the real method, and nulling
                 // its return corrupts every caller (execSQL(null), non-null
                 // contract NPEs, null event names in logging). Never hook them.
                 if (isStringDispatchTable(m)) {
-                    L.w(TAG, "skipping string-table method ${target.key}: ${m.declaringClass.name}.${m.name}/${m.parameterCount}")
+                    L.w(TAG, "skipping string-table method: ${m.declaringClass.name}.${m.name}/${m.parameterCount}")
                     continue
                 }
                 if (isLoaderInfra(m.declaringClass.name) || m.name in LOADER_INFRA_METHODS) {
-                    L.w(TAG, "skipping loader infra ${target.key}: ${m.declaringClass.name}.${m.name}/${m.parameterCount}")
+                    L.w(TAG, "skipping loader infra: ${m.declaringClass.name}.${m.name}/${m.parameterCount}")
                     continue
                 }
                 try {
-                    module.hook(m).intercept(hookerFor(action, "${target.key}: ${m.declaringClass.name}.${m.name}/${m.parameterCount}"))
+                    module.hook(m).intercept(hookerFor(action, surfaces,
+                        "${m.declaringClass.name}.${m.name}/${m.parameterCount}"))
                     installed++
-                    L.i(TAG, "hooked ${target.key}: ${m.declaringClass.name}.${m.name}/${m.parameterCount}")
+                    L.i(TAG, "hooked ads=$surfaces: ${m.declaringClass.name}.${m.name}/${m.parameterCount}")
                 } catch (t: Throwable) {
-                    L.w(TAG, "hook failed ${target.key}: ${m.declaringClass.name}.${m.name}", t)
+                    L.w(TAG, "hook failed ads=$surfaces: ${m.declaringClass.name}.${m.name}", t)
                 }
-            }
         }
         L.i(TAG, "Ad filter: $installed method hook(s) installed")
     }
 
-    private fun hookerFor(action: HookAction, label: String): Hooker = when (action) {        HookAction.BLOCK_NULL -> LoggingBlockHook(label)
-        HookAction.BLOCK_FALSE -> BlockFalseHook
-        HookAction.SPONSORED_NULL -> SponsoredNullHook
-        HookAction.RECEIVER_SPONSORED_NULL -> ReceiverSponsoredNullHook
+    private fun hookerFor(action: HookAction, surfaces: Set<AdSurface>, label: String): Hooker = when (action) {
+        HookAction.BLOCK_NULL -> LoggingBlockHook(label, surfaces)
+        HookAction.BLOCK_FALSE -> SurfaceFalseHook(surfaces)
+        HookAction.SPONSORED_NULL -> SponsoredNullHook(surfaces)
+        HookAction.RECEIVER_SPONSORED_NULL -> ReceiverSponsoredNullHook(surfaces)
     }
 
     /**
-     * Debug wrapper around [BlockHook]: logs the first invocation of each
+     * Logs the first blocked invocation of each
      * hooked method so the log right before any crash identifies the hook
      * that fired (hot paths — one log per method, then silent).
      */
-    private class LoggingBlockHook(private val label: String) : Hooker {
+    private class LoggingBlockHook(
+        private val label: String,
+        private val surfaces: Set<AdSurface>,
+    ) : Hooker {
         override fun intercept(chain: XposedInterface.Chain): Any? {
+            if (!enabled(surfaces)) return chain.proceed()
             if (!logged) {
                 logged = true
-                L.i(TAG, "block-null fired: $label")
+                L.i(TAG, "block-null fired ($surfaces): $label")
             }
-            if (!enabled()) return chain.proceed()
             return nullResult(chain.executable as? Method)
         }
         private var logged = false
@@ -181,7 +208,8 @@ object AdFilterHook {
      * dexplore reference filter was an OR over the anchor set, so we run one
      * DexKit class query per anchor and union the results), then hook each
      * declared method that returns boolean and takes at least one param,
-     * replacing it with false. Found class names are cached in prefs
+     * replacing it with false. Found class names and semantic surface sets
+     * are cached in prefs
      * ('cached_banner_classes' in the mod) so later launches skip the scan.
      *
      * Unlike the mod's cache, this one is stamped with the host and module
@@ -197,30 +225,29 @@ object AdFilterHook {
         val cached: Set<String> = cache.getStringSet(KEY_BANNER_CLASSES, emptySet()).orEmpty()
         val hostVersion = hostVersionCode(context)
         val moduleVersion = BuildConfig.VERSION_CODE
-        val fresh = cached.isNotEmpty() &&
+        val fresh = hostVersion > 0 && cached.isNotEmpty() &&
             cache.getInt(KEY_BANNER_HOST_VERSION, -1) == hostVersion &&
-            cache.getInt(KEY_BANNER_MODULE_VERSION, -1) == moduleVersion
+            cache.getInt(KEY_BANNER_MODULE_VERSION, -1) == moduleVersion &&
+            cache.getInt(KEY_BANNER_SCHEMA, -1) == BANNER_SCHEMA
 
-        val classNames: Set<String> = if (fresh) {
+        val classSurfaces: Map<String, Set<AdSurface>> = if (fresh) {
             L.i(TAG, "Banner scan: using ${cached.size} cached class(es) (fb=$hostVersion module=$moduleVersion)")
-            cached
-        } else if (bridge == null) {
-            // Cache-hit launch path: no DexKit bridge, so a stale set cannot be
-            // rebuilt on this launch. Sweeping the old names still beats no
-            // banner coverage at all — a name that no longer exists just fails
-            // Class.forName below and is skipped — and the loader guard makes a
-            // poisoned entry harmless. The stamps are left stale, so the first
-            // later launch that does have a bridge rebuilds the set; wiping it
-            // here would strand banner coverage until FB data was cleared.
-            if (cached.isEmpty()) {
-                L.w(TAG, "Banner scan: no cached classes and no bridge — skipping")
-                return
+            val parsed = cached.mapNotNull { spec ->
+                BannerClassCacheEntry.parse(spec)
+                    ?: run { L.w(TAG, "Skipping unclassified banner cache entry"); null }
             }
-            L.w(TAG, "Banner scan: ${cached.size} stale class(es) (fb=$hostVersion module=$moduleVersion), no bridge — using them, rebuild deferred")
-            cached
+            parsed.groupBy { it.className }
+                .mapValues { (_, records) -> records.flatMap { it.surfaces }.toSet() }
+        } else if (bridge == null) {
+            // No bridge is available on MethodCache fast path. Old unscoped
+            // banner records cannot safely be assigned to a new surface.
+            L.w(TAG, "Banner cache missing/stale with no DexKit; skipping until fresh discovery")
+            return
         } else {
-            val found = sortedSetOf<String>()
+            val found = LinkedHashMap<String, MutableSet<AdSurface>>()
             for (anchor in AdTargets.bannerAnchors) {
+                val origin = AdSurfacePolicy.bannerSurfaces(anchor)
+                if (origin.isEmpty()) continue // Unrelated Messenger/plan banners.
                 // Exact string-pool equality — the mod's dexplore reference
                 // filter matched whole constants (its anchor list carries
                 // 'banner_ad' AND 'banner_ads' separately). DexKit's default
@@ -235,16 +262,19 @@ object AdFilterHook {
                 } ?: continue
                 for (c in hits) {
                     if (isLoaderInfra(c.name)) continue
-                    found.add(c.name)
+                    if (c.name !in found && found.size >= MAX_BANNER_CLASSES) continue
+                    found.getOrPut(c.name) { linkedSetOf() }.addAll(origin)
                 }
-                if (found.size >= MAX_BANNER_CLASSES) break
             }
             L.i(TAG, "Banner scan: found ${found.size} class(es)")
             if (found.isNotEmpty()) {
                 cache.edit()
-                    .putStringSet(KEY_BANNER_CLASSES, found)
+                    .putStringSet(KEY_BANNER_CLASSES, found.map { (name, origin) ->
+                        BannerClassCacheEntry(name, origin).encode()
+                    }.toSet())
                     .putInt(KEY_BANNER_HOST_VERSION, hostVersion)
                     .putInt(KEY_BANNER_MODULE_VERSION, moduleVersion)
+                    .putInt(KEY_BANNER_SCHEMA, BANNER_SCHEMA)
                     .apply()
             }
             found
@@ -252,7 +282,7 @@ object AdFilterHook {
 
         var classesHooked = 0
         var methodsHooked = 0
-        for (name in classNames) {
+        for ((name, surfaces) in classSurfaces) {
             // See LOADER_INFRA_PREFIXES: never sweep the native library loader,
             // even when it comes out of a cache written before this guard.
             if (isLoaderInfra(name)) {
@@ -276,9 +306,9 @@ object AdFilterHook {
                     // native loader's entry points are never replaced.
                     if (m.name in LOADER_INFRA_METHODS) continue
                     try {
-                        module.hook(m).intercept(BlockFalseHook)
+                        module.hook(m).intercept(SurfaceFalseHook(surfaces))
                         methodsHooked++; hookedInClass++
-                        L.i(TAG, "banner hook: $name.${m.name}/${m.parameterCount}")
+                        L.i(TAG, "banner hook surfaces=$surfaces: $name.${m.name}/${m.parameterCount}")
                     } catch (t: Throwable) {
                         L.w(TAG, "banner hook failed: $name.${m.name}", t)
                     }
@@ -307,26 +337,18 @@ object AdFilterHook {
             m.parameterTypes[0] == Int::class.javaPrimitiveType
     }
 
-    /** Skip original, return null (or a primitive-safe default) — mod bsrnc preset-result. */
-    object BlockHook : Hooker {
+    /** Skip original, return false — gated per banner/ad-method surface. */
+    private class SurfaceFalseHook(private val surfaces: Set<AdSurface>) : Hooker {
         override fun intercept(chain: XposedInterface.Chain): Any? {
-            if (!enabled()) return chain.proceed()
-            return nullResult(chain.executable as? Method)
-        }
-    }
-
-    /** Skip original, return false — mod banner-ads replacement. */
-    object BlockFalseHook : Hooker {
-        override fun intercept(chain: XposedInterface.Chain): Any? {
-            if (!enabled()) return chain.proceed()
+            if (!enabled(surfaces)) return chain.proceed()
             return java.lang.Boolean.FALSE
         }
     }
 
     /** Ad-check receiver + args, null only sponsored — mod FNjBxTKppvYVTRFkExAd. */
-    object SponsoredNullHook : Hooker {
+    private class SponsoredNullHook(private val surfaces: Set<AdSurface>) : Hooker {
         override fun intercept(chain: XposedInterface.Chain): Any? {
-            if (!enabled()) return chain.proceed()
+            if (!enabled(surfaces)) return chain.proceed()
             return if (SponsoredCheck.isSponsored(chain.thisObject) ||
                 chain.args.any { SponsoredCheck.isSponsored(it) }
             ) {
@@ -344,11 +366,11 @@ object AdFilterHook {
      * type-node getter): String.valueOf(thisObject).contains("SPONSORED")
      * decides, so the getter nulls only sponsored mid-card units.
      */
-    object ReceiverSponsoredNullHook : Hooker {
+    private class ReceiverSponsoredNullHook(private val surfaces: Set<AdSurface>) : Hooker {
         private var logged = false
 
         override fun intercept(chain: XposedInterface.Chain): Any? {
-            if (!enabled()) return chain.proceed()
+            if (!enabled(surfaces)) return chain.proceed()
             val sponsored = runCatching {
                 chain.thisObject?.toString()?.contains("SPONSORED") == true
             }.getOrDefault(false)

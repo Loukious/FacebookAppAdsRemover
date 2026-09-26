@@ -11,9 +11,6 @@ import android.content.DialogInterface
 import android.content.Intent
 import android.graphics.Bitmap
 import android.graphics.BitmapFactory
-import android.graphics.Canvas
-import android.graphics.Color
-import android.graphics.Paint
 import android.graphics.Typeface
 import android.graphics.drawable.GradientDrawable
 import android.media.MediaCodec
@@ -26,11 +23,9 @@ import android.os.Environment
 import android.os.Handler
 import android.os.Looper
 import android.view.Gravity
-import android.view.MotionEvent
 import android.view.View
 import android.view.ViewGroup
 import android.widget.BaseAdapter
-import android.widget.FrameLayout
 import android.widget.ImageView
 import android.widget.LinearLayout
 import android.widget.ProgressBar
@@ -69,21 +64,17 @@ import java.util.concurrent.Executors
  *     It writes the raw dump to <dataDir>/APKMODDONE/DownloadVideo/AllData.txt
  *     and extracts the quality-URL ladder.
  *
- *  2. QUICK LINK — the mod injects a TextView ("Download video 📥",
- *     media.download.title) into the player controls (hook class
- *     YMipIyoBixtpR7utxfWU; controller pO4TjBxQp2IFO1UyrtSF). Clicking it opens
- *     the watched-videos dialog (XVv4O94z1XoxDaljJoG6, libnc.so.c 1045784) —
- *     one card per captured video (thumbnail + title + link-count/max-quality
- *     summary); tapping a card opens that video's QUICK VIDEO DOWNLOAD dialog.
- *     The exact injection hook is not yet fully reversed — see
- *     docs/unported-hooks.md — so this port shows the same button as a
- *     WindowManager overlay while a video is captured.
+ *  2. CONTEXTUAL UI — [ContextualDownloadHook] follows Morphe's native
+ *     Facebook surfaces: a real Download button is appended to the active
+ *     reel's UDD sidebar, while stories reuse Facebook's own Save row. Both
+ *     actions carry the tapped item's player/card into this downloader, so
+ *     prefetched neighbouring media cannot redirect the action.
  *
  *  3. QUICK VIDEO DOWNLOAD DIALOG — card tap (the mod's card action,
  *     GshsfL21ZSKG5nJgp93s, 126093) fetches the desktop page (E1s6) → the
  *     aIv5$bsrnc.run dialog (1068984): HD video / SD video / every MPD
  *     rendition "%s video" / Audio rows with quick_link.option.* subtitles,
- *     HD preselected, bottom row "Copy all URLs" / "Preview" / "Download".
+ *     HD preselected, bottom row "Copy URL" / "Preview" / "Download".
  *     (The mod's card SD/HD buttons, eFLd3885l8N8rPYV87zB @ 1146430, are not
  *     ported: 576 dumps carry a single progressive URL, so they could only
  *     fail — see docs/unported-hooks.md.)
@@ -247,19 +238,55 @@ object DownloadHook {
      */
     @Volatile private var recentVideos: List<VideoData> = emptyList()
 
+    /**
+     * Captures indexed by their real video id. Facebook constructs players for
+     * upcoming reels/stories before they are visible, so "the last capture" is
+     * not a safe answer to a UI click. Contextual download actions always
+     * resolve the id carried by the visible item through this map instead.
+     */
+    private val videosById = object : LinkedHashMap<String, VideoData>(64, 0.75f, true) {
+        override fun removeEldestEntry(eldest: MutableMap.MutableEntry<String, VideoData>?): Boolean =
+            size > 48
+    }
+
+    private val videosByIdLock = Any()
+
+    private fun captureRichness(data: VideoData): Int =
+        data.qualities.size +
+            (data.playlist?.videos?.size ?: 0) * 10 +
+            (data.playlist?.audios?.size ?: 0) * 4 +
+            (if (data.mediaDump.isNotEmpty()) 100 else 0)
+
     private fun registerCapture(data: VideoData) {
-        current = data
+        // A constructor capture has only the progressive pair, while the
+        // later media-setup capture may carry the whole DASH playlist. Never
+        // let that richer record be replaced by a later minimal observation.
+        val stored = synchronized(videosByIdLock) {
+            val old = videosById[data.videoId]
+            val chosen = if (old != null && captureRichness(old) > captureRichness(data)) {
+                old
+            } else {
+                data
+            }
+            videosById[data.videoId] = chosen
+            chosen
+        }
+        current = stored
         recentVideos = buildList {
-            add(data)
+            add(stored)
             for (v in recentVideos) {
-                if (v.videoId != data.videoId && size < 15) add(v)
+                if (v.videoId != stored.videoId && size < 15) add(v)
             }
         }
     }
 
-    /** Quick-link bubble + the activity whose decorView parents it. */
-    private var quickLink: QuickLinkBubble? = null
-    private var quickLinkActivity: Activity? = null
+    private fun videoById(videoId: String?): VideoData? {
+        if (videoId.isNullOrBlank()) return null
+        return synchronized(videosByIdLock) { videosById[videoId] }
+    }
+
+    /** The id currently reported by the player that actually started playback. */
+    @Volatile private var activeVideoId: String? = null
 
     // ------------------------------------------------------------------ data
 
@@ -412,35 +439,282 @@ object DownloadHook {
 
         override fun onActivityResumed(activity: Activity) {
             currentActivity = activity
-            // The bubble lives in the CURRENT activity's decor — every
-            // surface change inside the app (stories viewer, reels, feed)
-            // renders below it, so a re-attach here keeps it on top. A
-            // toggle turned off mid-session tears it down here too.
-            if (quickLinkWanted && Settings.getBoolean(Settings.DOWNLOAD_SHOW_ICON, true)) {
-                attachQuickLink(activity)
-            } else if (quickLinkWanted) {
-                hideQuickLink()
-            }
         }
 
         override fun onActivityPaused(activity: Activity) {
             if (currentActivity === activity) currentActivity = null
         }
 
-        override fun onActivityDestroyed(a: Activity) {
-            // The bubble dies with its activity's decor — drop the stale
-            // refs so the next resume rebuilds instead of re-parenting a
-            // view whose window is gone.
-            if (quickLinkActivity === a) {
-                quickLink = null
-                quickLinkActivity = null
-            }
-        }
+        override fun onActivityDestroyed(a: Activity) {}
 
         override fun onActivityCreated(a: Activity, b: android.os.Bundle?) {}
         override fun onActivityStarted(a: Activity) {}
         override fun onActivityStopped(a: Activity) {}
         override fun onActivitySaveInstanceState(a: Activity, b: android.os.Bundle) {}
+    }
+
+    // ------------------------------------------------ contextual media binding
+
+    /** Called by the real player start hook; unlike construction, this means the item is visible. */
+    fun onPlaybackStarted(videoId: String?) {
+        activeVideoId = videoId?.takeIf { it.isNotBlank() && it != NULL_MARKER }
+    }
+
+    /** Removes the reel action only when the player that owns it actually stopped. */
+    fun onPlaybackStopped(videoId: String?) {
+        if (videoId != null && activeVideoId == videoId) activeVideoId = null
+    }
+
+    /** Native reel-sidebar entry point: open this item's existing quality picker. */
+    fun openReelDownload(context: Context?, playerHost: Any?): Boolean {
+        if (!Settings.getBoolean(Settings.DOWNLOAD_SHOW_ICON, true)) return false
+        val videoId = videoIdFromPlayerParamsIn(playerHost) ?: return false
+        val data = videoById(videoId) ?: return false
+        val activity = context as? Activity ?: currentActivity ?: return false
+        main.post { openQuickDownload(activity, data) }
+        return true
+    }
+
+    /** Native reel-sidebar entry point for the existing Page repost flow. */
+    fun openReelRepost(context: Context?, playerHost: Any?): Boolean {
+        if (!Settings.getBoolean(Settings.DOWNLOAD_SHOW_ICON, true)) return false
+        val videoId = videoIdFromPlayerParamsIn(playerHost) ?: return false
+        val data = videoById(videoId) ?: return false
+        val activity = context as? Activity ?: currentActivity ?: return false
+        main.post { Repost.open(activity, data) }
+        return true
+    }
+
+    /**
+     * Story-menu entry point. The StoryCard carries the visible video's id;
+     * resolve that id to the capture made by VideoPlayerParams and open the
+     * existing per-video quality dialog. The active player is a safe fallback
+     * because it represents playback, not prefetch construction.
+     */
+    fun openStoryDownload(context: Context?, storyCard: Any?): Boolean {
+        if (!Settings.getBoolean(Settings.DOWNLOAD_SHOW_ICON, true)) return false
+        val data = storyVideoData(storyCard) ?: return false
+        val activity = context as? Activity ?: currentActivity ?: return false
+        main.post { openQuickDownload(activity, data) }
+        return true
+    }
+
+    /** Story three-dot entry point for the existing Page repost flow. */
+    fun openStoryRepost(context: Context?, storyCard: Any?): Boolean {
+        if (!Settings.getBoolean(Settings.DOWNLOAD_SHOW_ICON, true)) return false
+        val data = storyVideoData(storyCard) ?: return false
+        val activity = context as? Activity ?: currentActivity ?: return false
+        main.post { Repost.open(activity, data) }
+        return true
+    }
+
+    private fun storyVideoData(storyCard: Any?): VideoData? {
+        val ids = videoIdsIn(storyCard)
+        val active = activeVideoId
+        return active?.takeIf(ids::contains)?.let(::videoById)
+            ?: ids.firstNotNullOfOrNull(::videoById)
+            ?: storyDataFromCard(storyCard, ids.firstOrNull())
+    }
+
+    /**
+     * Morphe's fallback for stories: the card itself carries the progressive
+     * video URL even when the richer player capture has not landed yet.
+     */
+    private fun storyDataFromCard(storyCard: Any?, knownId: String?): VideoData? {
+        storyCard ?: return null
+        val media = runCatching {
+            storyCard.javaClass.methods.firstOrNull {
+                it.name == "getMedia" && it.parameterCount == 0
+            }?.invoke(storyCard)
+        }.getOrNull()
+        val urls = collectHttpUrls(media ?: storyCard, if (media != null) 1 else 2)
+        val videos = urls.filter(::looksLikeVideoFile).distinct()
+        if (videos.isEmpty()) return null
+        val id = knownId ?: "story_${System.identityHashCode(storyCard)}"
+        val qualities = videos.mapIndexed { index, url ->
+            Quality(if (index == 0) "Story video" else "Story video ${index + 1}", url, "mp4")
+        }
+        return VideoData(
+            videoId = id,
+            mediaDump = "",
+            qualities = qualities,
+            audioUrl = null,
+            postUrl = "",
+            thumbnailUrl = null,
+            playlist = null,
+        )
+    }
+
+    private fun looksLikeVideoFile(url: String): Boolean {
+        val lower = url.lowercase(Locale.US)
+        return lower.substringBefore('?').endsWith(".mp4") ||
+            lower.contains("video%2fmp4") ||
+            lower.contains("video/mp4")
+    }
+
+    private fun collectHttpUrls(root: Any?, maxDepth: Int): List<String> {
+        root ?: return emptyList()
+        val out = LinkedHashSet<String>()
+        val seen = java.util.IdentityHashMap<Any, Boolean>()
+        val queue = java.util.ArrayDeque<Pair<Any, Int>>()
+        queue.add(root to 0)
+        seen[root] = true
+        var nodes = 0
+
+        fun add(value: String) {
+            if (value.startsWith("http://") || value.startsWith("https://")) out.add(value)
+        }
+
+        while (queue.isNotEmpty() && nodes < 384) {
+            val (node, depth) = queue.removeFirst()
+            nodes++
+            when (node) {
+                is CharSequence -> {
+                    add(node.toString())
+                    continue
+                }
+                is android.net.Uri -> {
+                    add(node.toString())
+                    continue
+                }
+                is Iterable<*> -> {
+                    if (depth < maxDepth) node.forEach { value ->
+                        if (value != null && seen.put(value, true) == null) {
+                            queue.add(value to (depth + 1))
+                        }
+                    }
+                    continue
+                }
+            }
+            if (depth >= maxDepth) continue
+
+            var type: Class<*>? = node.javaClass
+            while (type != null && type != Any::class.java) {
+                val current = type
+                for (field in runCatching { current.declaredFields }.getOrElse { emptyArray() }) {
+                    if (java.lang.reflect.Modifier.isStatic(field.modifiers)) continue
+                    val value = runCatching {
+                        field.isAccessible = true
+                        field.get(node)
+                    }.getOrNull() ?: continue
+                    when (value) {
+                        is CharSequence -> add(value.toString())
+                        is android.net.Uri -> add(value.toString())
+                        else -> {
+                            val name = value.javaClass.name
+                            if ((name.startsWith("com.facebook.") || name.startsWith("X.") ||
+                                    value is Iterable<*>) && seen.put(value, true) == null
+                            ) {
+                                queue.add(value to (depth + 1))
+                            }
+                        }
+                    }
+                }
+                type = current.superclass
+            }
+        }
+        return out.toList()
+    }
+
+    /**
+     * Finds short numeric ids reachable from one Facebook model/component.
+     * This mirrors Morphe's bounded StoryCard walk: depth 3, 512 nodes, and
+     * only Facebook/Redex objects are traversed. URL strings are ignored so
+     * timestamps or CDN path numbers cannot be mistaken for a video id.
+     */
+    private fun videoIdsIn(root: Any?): List<String> {
+        root ?: return emptyList()
+        val found = LinkedHashSet<String>()
+        val idPattern = Regex("\\d{8,20}")
+        val seen = java.util.IdentityHashMap<Any, Boolean>()
+        val queue = java.util.ArrayDeque<Pair<Any, Int>>()
+        queue.add(root to 0)
+        seen[root] = true
+        var nodes = 0
+
+        fun addText(text: String) {
+            if (text.length > 40 || text.startsWith("http://") || text.startsWith("https://")) return
+            idPattern.findAll(text).forEach { found.add(it.value) }
+        }
+
+        while (queue.isNotEmpty() && nodes < 512) {
+            val (node, depth) = queue.removeFirst()
+            nodes++
+
+            if (node.javaClass.name == PARAMS_CLASS) {
+                runCatching { node.toString().removePrefix(VIDEO_ID_MARKER) }
+                    .getOrNull()?.let(::addText)
+            }
+
+            var type: Class<*>? = node.javaClass
+            while (type != null && type != Any::class.java) {
+                val currentType = type
+                val fields = runCatching { currentType.declaredFields }.getOrElse { emptyArray() }
+                for (field in fields) {
+                    if (java.lang.reflect.Modifier.isStatic(field.modifiers)) continue
+                    val value = runCatching {
+                        field.isAccessible = true
+                        field.get(node)
+                    }.getOrNull() ?: continue
+                    if (value is CharSequence) {
+                        addText(value.toString())
+                        continue
+                    }
+                    if (depth >= 3) continue
+                    val name = value.javaClass.name
+                    if (!name.startsWith("com.facebook.") && !name.startsWith("X.")) continue
+                    if (seen.put(value, true) != null) continue
+                    queue.add(value to (depth + 1))
+                }
+                type = currentType.superclass
+            }
+        }
+        return found.toList()
+    }
+
+    /**
+     * Reels have a stronger signal than stories: Morphe's sidebar object walk
+     * reaches VideoPlayerParams directly. Use only that typed object here so a
+     * profile/story/user id elsewhere in the component can never mark a reel.
+     */
+    private fun videoIdFromPlayerParamsIn(root: Any?): String? {
+        root ?: return null
+        val seen = java.util.IdentityHashMap<Any, Boolean>()
+        val queue = java.util.ArrayDeque<Pair<Any, Int>>()
+        queue.add(root to 0)
+        seen[root] = true
+        var nodes = 0
+
+        while (queue.isNotEmpty() && nodes < 256) {
+            val (node, depth) = queue.removeFirst()
+            nodes++
+            if (node.javaClass.name == PARAMS_CLASS) {
+                return runCatching {
+                    node.toString().removePrefix(VIDEO_ID_MARKER)
+                        .takeIf { it.isNotBlank() && it != NULL_MARKER }
+                }.getOrNull()
+            }
+            if (depth >= 3) continue
+
+            var type: Class<*>? = node.javaClass
+            while (type != null && type != Any::class.java) {
+                val currentType = type
+                for (field in runCatching { currentType.declaredFields }.getOrElse { emptyArray() }) {
+                    if (java.lang.reflect.Modifier.isStatic(field.modifiers)) continue
+                    val value = runCatching {
+                        field.isAccessible = true
+                        field.get(node)
+                    }.getOrNull() ?: continue
+                    val name = value.javaClass.name
+                    if (name != PARAMS_CLASS &&
+                        !name.startsWith("com.facebook.") && !name.startsWith("X.")) continue
+                    if (seen.put(value, true) != null) continue
+                    queue.add(value to (depth + 1))
+                }
+                type = currentType.superclass
+            }
+        }
+        return null
     }
 
     // -------------------------------------------------------------- thumbnails
@@ -668,7 +942,6 @@ object DownloadHook {
                 playlist = null,
             )
             registerCapture(data)
-            main.post { showQuickLink() }
             L.i(TAG, "captured video $id via params-ctor (${qualities.size} qualities)")
             logVideoLinks(data)
         }
@@ -922,7 +1195,6 @@ object DownloadHook {
         // Mod store writes (AllData.txt header mirrors the mod's
         // RichVideoPlayerParams text: "VideoId: <id>, GraphQLMedia=<dump>").
         io.execute { persist(videoId, "$VIDEO_ID_MARKER$videoId, GraphQLMedia=$mediaDump", mediaDump, data) }
-        main.post { showQuickLink() }
         L.i(TAG, "captured video $videoId via media-setup " +
                 "(${qualities.size} qualities, audio=${audioUrl != null}, " +
                 "thumb=${data.thumbnailUrl != null}, " +
@@ -1052,7 +1324,6 @@ object DownloadHook {
 
         // Mod writes AllData.txt + the per-video JSON store on a worker.
         io.execute { persist(videoId, params, mediaDump, data) }
-        main.post { showQuickLink() }
         L.i(TAG, "captured video $videoId (${qualities.size} qualities, " +
                 "audio=${audioUrl != null}, thumb=${data.thumbnailUrl != null})")
         logVideoLinks(data)
@@ -1425,181 +1696,6 @@ object DownloadHook {
         }.onFailure { L.w(TAG, "persist failed", it) }
     }
 
-    // -------------------------------------------------------------- quick link
-
-    /**
-     * The quick-link bubble: a filled circle with a white download arrow
-     * (restyle requested 2026-09-15 — replaced the "Download video 📥"
-     * pill). Self-sizing to 44dp.
-     */
-    private class QuickLinkBubble(context: Context) : View(context) {
-
-        private val density = context.resources.displayMetrics.density
-        private val paint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
-            color = Color.WHITE
-            style = Paint.Style.STROKE
-            strokeWidth = 2.2f * density
-            strokeCap = Paint.Cap.ROUND
-            strokeJoin = Paint.Join.ROUND
-        }
-
-        init {
-            background = GradientDrawable().apply {
-                shape = GradientDrawable.OVAL
-                setColor(0xE6325082.toInt())
-            }
-            elevation = 4f * density
-            contentDescription = "Download video" // mod key media.download.title
-        }
-
-        override fun onMeasure(widthSpec: Int, heightSpec: Int) {
-            val size = (density * 44f).toInt()
-            setMeasuredDimension(size, size)
-        }
-
-        override fun onDraw(canvas: Canvas) {
-            super.onDraw(canvas)
-            val w = width.toFloat()
-            val h = height.toFloat()
-            val cx = w / 2f
-            // Arrow shaft + head, and the tray line under it.
-            canvas.drawLine(cx, h * 0.30f, cx, h * 0.56f, paint)
-            canvas.drawLine(cx - w * 0.11f, h * 0.45f, cx, h * 0.585f, paint)
-            canvas.drawLine(cx, h * 0.585f, cx + w * 0.11f, h * 0.45f, paint)
-            canvas.drawLine(w * 0.30f, h * 0.71f, w * 0.70f, h * 0.71f, paint)
-        }
-    }
-
-    /**
-     * Shows the quick-link bubble on the current activity. The mod injects it
-     * into the player's controls LinearLayout (LayoutParams(MATCH_PARENT,
-     * WRAP_CONTENT)); until that injection hook is reversed this port shows an
-     * equivalent floating bubble.
-     *
-     * 2026-09-15 redesign: the bubble is a child of the activity's decorView,
-     * NOT a WindowManager window. On-device window dumps (FB 577) show the
-     * stories viewer and reels render INSIDE the single FbMainTabActivity
-     * window — there is no separate window to float over — while the old
-     * TYPE_APPLICATION window ended up GONE with no surface after surface
-     * switches, which is why the button appeared only on whichever surface
-     * captured first. A last decor child sits above every in-window surface
-     * (feed, reels, stories viewer) by construction.
-     */
-    private fun showQuickLink() {
-        // Icon visibility is a live setting — off means no new bubble and
-        // any existing one is torn down.
-        if (!Settings.getBoolean(Settings.DOWNLOAD_SHOW_ICON, true)) {
-            hideQuickLink()
-            return
-        }
-        quickLinkWanted = true
-        currentActivity?.let { attachQuickLink(it) }
-    }
-
-    /** Clears the wanted flag and removes any attached bubble. */
-    private fun hideQuickLink() {
-        quickLinkWanted = false
-        runCatching { (quickLink?.parent as? ViewGroup)?.removeView(quickLink) }
-            .onFailure { L.w(TAG, "quick-link detach failed", it) }
-        quickLink = null
-        quickLinkActivity = null
-    }
-
-    /** Idempotent: builds the bubble and parents it to [activity]'s decor. */
-    @SuppressLint("ClickableViewAccessibility")
-    private fun attachQuickLink(activity: Activity) {
-        if (quickLink != null && quickLinkActivity === activity) {
-            // Already attached — just stay above anything FB added since.
-            runCatching { quickLink?.bringToFront() }
-            return
-        }
-        // A bubble from another activity cannot be reused across contexts —
-        // onActivityDestroyed clears dead refs; this covers live switches.
-        (quickLink?.parent as? ViewGroup)?.removeView(quickLink)
-        quickLink = null
-        runCatching {
-            val bubble = QuickLinkBubble(activity).apply {
-                // Resolve the activity at click time — the view may outlive the
-                // activity it was created on.
-                setOnClickListener { onQuickLinkClick(currentActivity ?: activity) }
-                // Drag to move, tap to open — the bubble is not
-                // player-anchored, so let the user reposition it.
-                var downX = 0f
-                var downY = 0f
-                var startR = 0
-                var startB = 0
-                var moved = false
-                setOnTouchListener { v, e ->
-                    val lp = v.layoutParams as? FrameLayout.LayoutParams
-                        ?: return@setOnTouchListener false
-                    when (e.action) {
-                        MotionEvent.ACTION_DOWN -> {
-                            downX = e.rawX; downY = e.rawY
-                            startR = lp.rightMargin; startB = lp.bottomMargin
-                            moved = false
-                            true
-                        }
-                        MotionEvent.ACTION_MOVE -> {
-                            // BOTTOM|END anchor: margins grow toward the
-                            // screen center, so the raw drag delta is
-                            // sign-flipped against them.
-                            val maxW = v.resources.displayMetrics.widthPixels
-                            val maxH = v.resources.displayMetrics.heightPixels
-                            lp.rightMargin = (startR - (e.rawX - downX).toInt())
-                                .coerceIn(0, maxW)
-                            lp.bottomMargin = (startB - (e.rawY - downY).toInt())
-                                .coerceIn(0, maxH)
-                            quickLinkX = lp.rightMargin
-                            quickLinkY = lp.bottomMargin
-                            v.requestLayout()
-                            moved = true
-                            true
-                        }
-                        MotionEvent.ACTION_UP -> {
-                            if (!moved) v.performClick()
-                            true
-                        }
-                        else -> false
-                    }
-                }
-            }
-            // The decor is a FrameLayout; the bubble anchors to the bottom-end
-            // corner, offset by the last dragged position.
-            val lp = FrameLayout.LayoutParams(
-                FrameLayout.LayoutParams.WRAP_CONTENT,
-                FrameLayout.LayoutParams.WRAP_CONTENT,
-                Gravity.BOTTOM or Gravity.END,
-            ).apply {
-                rightMargin = quickLinkX
-                bottomMargin = quickLinkY
-            }
-            (activity.window.decorView as ViewGroup).addView(bubble, lp)
-            quickLink = bubble
-            quickLinkActivity = activity
-            L.i(TAG, "quick-link bubble attached to ${activity.javaClass.simpleName}")
-        }.onFailure { L.w(TAG, "quick-link attach failed", it) }
-    }
-
-    /** Set once any capture landed — the bubble returns when FB re-foregrounds. */
-    @Volatile private var quickLinkWanted = false
-
-    /** Last dragged position (BOTTOM|END margins), kept across rebuilds. */
-    private var quickLinkX = 32
-    private var quickLinkY = 200
-
-    /** GlpYnD4fzyFAQr8O2uoN.onClick port: recent-videos list → card tap. */
-    private fun onQuickLinkClick(activity: Activity) {
-        val videos = recentVideos.ifEmpty { listOfNotNull(current) }
-        // Mod behavior: the overlay always opens the ~15-recently-viewed
-        // list — even a single capture shows the card menu.
-        if (videos.isEmpty()) {
-            // Mod: quick_link.toast.invalid_download_url when nothing captured.
-            Toast.makeText(activity, "No video captured yet", Toast.LENGTH_SHORT).show()
-        } else {
-            showVideoList(activity, videos)
-        }
-    }
-
     /**
      * XVv4O94z1XoxDaljJoG6 port (libnc.so.c 1045784): the "Facebook Videos"
      * watched-list — one card per captured video (thumbnail + title +
@@ -1886,6 +1982,11 @@ object DownloadHook {
                 quickItems(data, fetched), quickAudioUrl(data, fetched))
             return
         }
+        val capturedOnly = quickItems(data, null)
+        if (data.postUrl.isBlank()) {
+            showQuickDownloadDialog(activity, data.videoId, capturedOnly, quickAudioUrl(data, null))
+            return
+        }
         Toast.makeText(activity, "Getting available qualities…", Toast.LENGTH_SHORT)
             .show() // quick_link.toast.loading
         io.execute {
@@ -1893,7 +1994,7 @@ object DownloadHook {
                 .onFailure { L.w(TAG, "qualities fetch failed", it) }.getOrNull()
                 ?: fetchCache[data.videoId]
             fetched?.let { fetchCache[data.videoId] = it }
-            val items = fetched?.let { quickItems(data, it) } ?: emptyList()
+            val items = quickItems(data, fetched)
             main.post {
                 if (items.isEmpty()) {
                     Toast.makeText(activity,
@@ -1985,7 +2086,7 @@ object DownloadHook {
      * aIv5$bsrnc.run port (libnc.so.c 1068984): the QUICK VIDEO DOWNLOAD
      * dialog — title + summary, scrollable item rows (title + subtitle, tap
      * = select, no dismissal), the HD row preselected (mod loop at 1071982),
-     * and a bottom action row "Copy all URLs" / "Preview" / "Download"
+     * and a bottom action row "Copy URL" / "Preview" / "Download"
      * (quick_link.action.*).
      */
     private fun showQuickDownloadDialog(activity: Activity, logId: String,
@@ -2056,13 +2157,14 @@ object DownloadHook {
             orientation = LinearLayout.HORIZONTAL
             gravity = Gravity.END
             setPadding(dp(16), dp(6), dp(16), dp(6))
-            addView(actionButton("Copy all URLs") { // quick_link.action.copy_all
+            addView(actionButton("Copy URL") {
                 val cm = activity.getSystemService(Context.CLIPBOARD_SERVICE)
                         as ClipboardManager
+                val quality = items[selected.get()]
                 cm.setPrimaryClip(ClipData.newPlainText("FacebookAppAdsRemover",
-                    items.joinToString("\n") { it.url }))
-                Toast.makeText(activity, "All URLs copied.", Toast.LENGTH_SHORT)
-                    .show() // toast.copy_all_done
+                    quality.url))
+                Toast.makeText(activity, "${quality.label} URL copied.", Toast.LENGTH_SHORT)
+                    .show()
             })
             addView(actionButton("Preview") { // quick_link.action.preview
                 val url = items[selected.get()].url

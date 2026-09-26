@@ -2,6 +2,7 @@ package tn.loukious.facebookappadsremover.hooks
 
 import tn.loukious.facebookappadsremover.core.L
 import tn.loukious.facebookappadsremover.core.Settings
+import tn.loukious.facebookappadsremover.core.AdSurface
 import io.github.libxposed.api.XposedInterface
 import io.github.libxposed.api.XposedInterface.Hooker
 import org.luckypray.dexkit.DexKitBridge
@@ -109,8 +110,9 @@ object AdsOptOutHook {
     }
 
     /**
-     * Hk8o beforeHookedMethod port: return Boolean.TRUE while the master ad
-     * toggle is on, so FB treats every session as ad-free.
+     * Hk8o beforeHookedMethod port: the getter is GLOBAL (not scoped to feed,
+     * Stories or Reels). Only spoof ad-free when every ad family is selected;
+     * enabling just Story ads must not suppress News Feed or Marketplace ads.
      */
     private object SpoofHook : Hooker {
         override fun intercept(chain: XposedInterface.Chain): Any? {
@@ -120,5 +122,7 @@ object AdsOptOutHook {
     }
 
     private fun spoofEnabled(): Boolean =
-        Settings.getBoolean(Settings.ADS_ENABLED, true)
+        Settings.blockAdsOn(setOf(AdSurface.NEWS_FEED, AdSurface.STORIES, AdSurface.REELS)) &&
+            Settings.getBoolean(Settings.ADS_MARKETPLACE, true) &&
+            Settings.getBoolean(Settings.ADS_GAME_ADS, true)
 }

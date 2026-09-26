@@ -120,8 +120,7 @@ object MarketplaceAdsHook {
      * so flipping the toggle applies without a reinstall.
      */
     private fun enabled(): Boolean =
-        Settings.getBoolean(Settings.ADS_ENABLED, true) &&
-            Settings.getBoolean(Settings.ADS_MARKETPLACE, true)
+        Settings.getBoolean(Settings.ADS_MARKETPLACE, true)
 
     // ------------------------------------------------------------------
     // Full-scan entry (DexKit available)

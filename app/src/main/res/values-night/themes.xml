@@ -1,8 +1,10 @@
 <resources xmlns:tools="http://schemas.android.com/tools">
-    <style name="Theme.FBAR" parent="Theme.MaterialComponents.DayNight.DarkActionBar">
+    <style name="Theme.FBAR" parent="Theme.Material3.DayNight">
         <item name="colorPrimary">@color/fb_blue</item>
         <item name="colorPrimaryVariant">@color/fb_blue_dark</item>
         <item name="colorOnPrimary">@color/black</item>
-        <item name="android:statusBarColor">?attr/colorPrimaryVariant</item>
+        <item name="dynamicColorThemeOverlay">@style/ThemeOverlay.Material3.DynamicColors.DayNight</item>
+        <item name="android:statusBarColor">?attr/colorSurface</item>
+        <item name="android:navigationBarColor">?attr/colorSurface</item>
     </style>
 </resources>

@@ -50,9 +50,21 @@ data class ToggleSection(
 val TOGGLE_SECTIONS: List<ToggleSection> = listOf(
     ToggleSection("Ads", listOf(
         ToggleSpec(
-            Settings.ADS_ENABLED,
-            "Block ads",
-            "Home-feed sponsored stories, video ads, banners and the ad-free-session spoof — one switch",
+            Settings.ADS_NEWS_FEED,
+            "Block News Feed ads",
+            "Sponsored feed posts, multi-ad units and ad-channel requests; cached-feed ad blocking also requires the CSR guard below",
+            true,
+        ),
+        ToggleSpec(
+            Settings.ADS_STORIES,
+            "Block Story ads",
+            "Sponsored story buckets and story-player ad breaks",
+            true,
+        ),
+        ToggleSpec(
+            Settings.ADS_REELS,
+            "Block Reels ads",
+            "Dedicated Reels/Shorts ads and banners; shared video/ad-break hooks also require Block Story ads",
             true,
         ),
         ToggleSpec(
@@ -69,14 +81,8 @@ val TOGGLE_SECTIONS: List<ToggleSection> = listOf(
         ),
         ToggleSpec(
             Settings.ADS_FEED_GUARD,
-            "Feed ad guard (CSR experiment)",
-            "Second feed pipeline used by FB's CSR experiment cohort — filters sponsored units the classic feed filter never sees",
-            true,
-        ),
-        ToggleSpec(
-            Settings.ADS_REELS_SHOPPING,
-            "Block reels shopping cards",
-            "The small \"Shop now\" product-card banner overlaying promotional reels — blocked at render time",
+            "Enable CSR feed ad guard",
+            "Additional News Feed cache/render protection; follows Block News Feed ads and does not disable AI/keyword filtering",
             true,
         ),
     )),
@@ -94,7 +100,7 @@ val TOGGLE_SECTIONS: List<ToggleSection> = listOf(
         ToggleSpec(
             Settings.FEED_AI_CONTENT,
             "Hide AI-generated content",
-            "Drops stories tagged with the gen-AI transparency flag (\"AI info\") — self-disclosed AI posts",
+            "Drops stories carrying Facebook's AI transparency label — self-disclosed or Meta-detected AI content",
             false,
         ),
         ToggleSpec(
@@ -121,12 +127,36 @@ val TOGGLE_SECTIONS: List<ToggleSection> = listOf(
     )),
     ToggleSection("Appearance", listOf(
         ToggleSpec(Settings.APPEARANCE_DARK, "Force dark mode", "ThemePreferences + FbFragmentActivity isDarkMode → true", false),
+        ToggleSpec(
+            Settings.APPEARANCE_AMOLED,
+            "AMOLED black mode",
+            "Morphe-style true-black backgrounds for Facebook dark mode; enable Facebook dark mode or Force dark mode too",
+            false,
+        ),
     )),
     ToggleSection("Privacy", listOf(
         ToggleSpec(Settings.PRIVACY_ALLOW_CAPTURE, "Allow screenshots & recording", "Clears FLAG_SECURE on every activity", false),
         ToggleSpec(Settings.PRIVACY_BLOCK_DETECTION, "Block capture detection", "FB's screenshot/recording watchers", false),
     )),
     ToggleSection("Navigation", listOf(
+        ToggleSpec(
+            Settings.NAV_HIDE_REELS_TAB,
+            "Hide Reels tab",
+            "Remove only the Reels button from Facebook's top/bottom tab bar; Reels still opens from links and the menu",
+            false,
+        ),
+        ToggleSpec(
+            Settings.NAV_HIDE_MARKETPLACE_TAB,
+            "Hide Marketplace tab",
+            "Remove only the Marketplace tab-bar button; Marketplace remains available elsewhere",
+            false,
+        ),
+        ToggleSpec(
+            Settings.NAV_HIDE_GAMES_TAB,
+            "Hide Games tab",
+            "Remove only the Games/Gaming tab-bar button; games remain accessible from the menu and links",
+            false,
+        ),
         ToggleSpec(
             Settings.NAVIGATION_ACTIVITY_LIST,
             "Activity list (Intent dump)",
@@ -146,8 +176,8 @@ val TOGGLE_SECTIONS: List<ToggleSection> = listOf(
         ToggleSpec(Settings.DOWNLOAD_USE_BROWSER, "Download via browser", "Hand media URLs to the browser instead of the in-module downloader", true),
         ToggleSpec(
             Settings.DOWNLOAD_SHOW_ICON,
-            "Show download icon",
-            "The floating download bubble that appears once a video is captured — hide it if you only download via copied links",
+            "Show contextual download actions",
+            "Shows Download on the active reel and enables Save for the story currently open; each action is bound to that media item",
             true,
         ),
         ToggleSpec(
@@ -158,7 +188,7 @@ val TOGGLE_SECTIONS: List<ToggleSection> = listOf(
         ),
     )),
     ToggleSection("Video", listOf(
-        ToggleSpec(Settings.VIDEO_RESUME, "Resume video position", "Seek back to the saved position when a video is re-opened", true),
+        ToggleSpec(Settings.VIDEO_RESUME, "Resume video position", "Optional one-time resume when a video reopens; manual seeking always takes priority", false),
         ToggleSpec(Settings.VIDEO_BACKGROUND, "Background playback", "Keep the tracked video playing while the app is backgrounded (no floating window)", false),
     )),
     // No toggles of its own: the export/import buttons are the whole section.

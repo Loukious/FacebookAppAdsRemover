@@ -13,9 +13,11 @@ import tn.loukious.facebookappadsremover.hooks.AccountHook
 import tn.loukious.facebookappadsremover.hooks.ActivityListHook
 import tn.loukious.facebookappadsremover.hooks.AdFilterHook
 import tn.loukious.facebookappadsremover.hooks.AdsOptOutHook
+import tn.loukious.facebookappadsremover.hooks.AmoledThemeHook
 import tn.loukious.facebookappadsremover.hooks.AutoRefreshHook
 import tn.loukious.facebookappadsremover.hooks.BackgroundPlaybackHook
 import tn.loukious.facebookappadsremover.hooks.CleanUrlHook
+import tn.loukious.facebookappadsremover.hooks.ContextualDownloadHook
 import tn.loukious.facebookappadsremover.hooks.DownloadHook
 import tn.loukious.facebookappadsremover.hooks.DarkModeHook
 import tn.loukious.facebookappadsremover.hooks.FeedGuardHook
@@ -23,8 +25,8 @@ import tn.loukious.facebookappadsremover.hooks.GameAdsHook
 import tn.loukious.facebookappadsremover.hooks.HideSeenStoryHook
 import tn.loukious.facebookappadsremover.hooks.MarketplaceAdsHook
 import tn.loukious.facebookappadsremover.hooks.NewsfeedFilterHook
+import tn.loukious.facebookappadsremover.hooks.NavigationTabHook
 import tn.loukious.facebookappadsremover.hooks.PrivacyHook
-import tn.loukious.facebookappadsremover.hooks.ReelsShoppingHook
 import tn.loukious.facebookappadsremover.hooks.StoryFeedViewerHook
 import tn.loukious.facebookappadsremover.hooks.StoriesTrayHook
 import tn.loukious.facebookappadsremover.hooks.VideoResumeHook
@@ -135,6 +137,12 @@ class ModuleMain : XposedModule() {
         runCatching { Settings.init(this, context) }
             .onFailure { L.e(TAG, "Settings init failed — toggles fall back to defaults", it) }
 
+        // Morphe-style AMOLED theme. Framework seams are available as soon as
+        // the app process exists; Facebook's own colour resolvers arrive with
+        // the secondary dexes and are attached by the retry probe below.
+        runCatching { AmoledThemeHook.installFramework(this) }
+            .onFailure { L.e(TAG, "AMOLED framework hooks failed", it) }
+
         try {
             System.loadLibrary("dexkit")
         } catch (t: Throwable) {
@@ -171,6 +179,13 @@ class ModuleMain : XposedModule() {
         runCatching { PrivacyHook.install(this) }
             .onFailure { L.e(TAG, "Privacy hooks failed", it) }
 
+        // Hide only selected top/bottom navigation icons, not the backing
+        // navigation routes. Framework fallback is ready before FB inflates
+        // the bar; stable TabBarContainerLayout callback is armed on the same
+        // secondary-dex retry cadence as other Facebook-specific hooks.
+        runCatching { NavigationTabHook.installFramework(this) }
+            .onFailure { L.e(TAG, "Navigation tab framework hook failed", it) }
+
         // Activity list: framework-class observer on
         // Activity.startActivityForResult — no DexKit, installed at boot like
         // the mod's "Hook Start Activity" installer. Dump output is gated on
@@ -205,6 +220,9 @@ class ModuleMain : XposedModule() {
     private var paramsHookTried = false
     private var clipboardHookTried = false
     private var darkActivityHookTried = false
+    private var amoledResolversReady = false
+    private var newsfeedUiFallbackReady = false
+    private var navigationTabNativeReady = false
     private var discoveryRan = false
 
     private fun probeAndMaybeDiscover(context: Context) {
@@ -218,6 +236,16 @@ class ModuleMain : XposedModule() {
         if (!darkActivityHookTried) {
             darkActivityHookTried = DarkModeHook.installActivityHook(this, classLoader)
             if (darkActivityHookTried) L.i(TAG, "Dark-mode activity hook installed")
+        }
+        if (!amoledResolversReady) {
+            amoledResolversReady = AmoledThemeHook.installFacebookResolvers(this, classLoader)
+            if (amoledResolversReady) L.i(TAG, "AMOLED Facebook colour resolvers installed")
+        }
+        if (!newsfeedUiFallbackReady) {
+            newsfeedUiFallbackReady = NewsfeedFilterHook.installUiFallback(this, classLoader)
+        }
+        if (!navigationTabNativeReady) {
+            navigationTabNativeReady = NavigationTabHook.installNative(this, classLoader)
         }
         // M4: video params capture — stable class name, needs only the
         // secondary dexes to attach (same cadence as the account hook).
@@ -296,6 +324,36 @@ class ModuleMain : XposedModule() {
             L.i(TAG, "Discovery cache predates media-setup hook — rescanning")
             return false
         }
+        val contextualStoryState = try {
+            MethodCache.loadClass(context, ContextualDownloadHook.STORY_CACHE_KEY)
+        } catch (t: Throwable) {
+            L.w(TAG, "discovery cache class read failed", t); null
+        }
+        val contextualReelState = try {
+            MethodCache.loadClass(context, ContextualDownloadHook.REEL_CACHE_KEY)
+        } catch (t: Throwable) {
+            L.w(TAG, "discovery cache class read failed", t); null
+        }
+        if (contextualStoryState == null || contextualReelState == null) {
+            L.i(TAG, "Discovery cache predates contextual downloader — rescanning")
+            return false
+        }
+        if (contextualStoryState != "absent" &&
+            contextualStoryState != ContextualDownloadHook.STORY_CACHE_VERSION
+        ) {
+            L.i(TAG, "Contextual story cache predates native-menu hook — rescanning")
+            return false
+        }
+        if (ContextualDownloadHook.reelCacheNeedsRescan(contextualReelState)) {
+            L.i(TAG, "Contextual reel cache expired or predates native-sidebar hook — rescanning")
+            return false
+        }
+        if (!ContextualDownloadHook.isReelAbsent(contextualReelState) &&
+            methods[ContextualDownloadHook.REEL_CACHE_KEY]?.size != 4
+        ) {
+            L.i(TAG, "Contextual reel cache missing native-sidebar methods — rescanning")
+            return false
+        }
         // Same for a pre-M2.7 cache: the story-viewer render methods. The
         // class-map entry doubles as a discovery outcome sentinel — "absent"
         // means the anchor wasn't found on this FB build (no methods to
@@ -327,6 +385,15 @@ class ModuleMain : XposedModule() {
         }
         if (darkState == null) {
             L.i(TAG, "Discovery cache predates dark-mode hook — rescanning")
+            return false
+        }
+        val amoledResolverState = try {
+            MethodCache.loadClass(context, AmoledThemeHook.CACHE_KEY)
+        } catch (t: Throwable) {
+            L.w(TAG, "discovery cache class read failed", t); null
+        }
+        if (amoledResolverState == null) {
+            L.i(TAG, "Discovery cache predates AMOLED view resolver — rescanning")
             return false
         }
         // Same for a pre-auto-refresh cache: the refresh blocker methods.
@@ -390,14 +457,13 @@ class ModuleMain : XposedModule() {
             L.i(TAG, "Discovery cache predates pause-method key — rescanning")
             return false
         }
-        // Same for the ported ad guards (marketplace, game ads, feed guard,
-        // reels shopping cards): each caches its discovered classes in the
+        // Same for the ported ad guards (marketplace, game ads, feed guard):
+        // each caches its discovered classes in the
         // shared class map, so a cache written before a port lacks that
         // hook's entry.
         if (!MarketplaceAdsHook.cachePresent(context) ||
             !GameAdsHook.cachePresent(context) ||
-            !FeedGuardHook.cachePresent(context) ||
-            !ReelsShoppingHook.cachePresent(context)
+            !FeedGuardHook.cachePresent(context)
         ) {
             L.i(TAG, "Discovery cache predates a ported ad guard — rescanning")
             return false
@@ -414,7 +480,11 @@ class ModuleMain : XposedModule() {
             }.onFailure { L.e(TAG, "Banner scan failed", it) }
             runCatching {
                 NewsfeedFilterHook.init(context)
-                NewsfeedFilterHook.installCached(this, classLoader, runnableClass)
+                val feedReady = NewsfeedFilterHook.installCached(this, classLoader, runnableClass)
+                if (!feedReady) {
+                    L.w(TAG, "Cached classic-feed hook invalid — rediscovering next FB start")
+                    MethodCache.invalidateClass(context, "feed.processNewStories")
+                }
             }.onFailure { L.e(TAG, "Newsfeed filter installation failed", it) }
             adsOptOutClass?.let {
                 runCatching {
@@ -424,7 +494,6 @@ class ModuleMain : XposedModule() {
             MarketplaceAdsHook.installFromCache(this, classLoader, context)
             GameAdsHook.installFromCache(this, classLoader, context)
             FeedGuardHook.installFromCache(this, classLoader, context)
-            ReelsShoppingHook.installFromCache(this, classLoader, context)
             if (storyViewerState != "absent") {
                 runCatching {
                     StoryFeedViewerHook.installCached(this, methods[StoryFeedViewerHook.CACHE_KEY].orEmpty())
@@ -445,6 +514,14 @@ class ModuleMain : XposedModule() {
                 }.onFailure { L.e(TAG, "Dark-mode installation failed", it) }
             } else {
                 L.i(TAG, "Dark-mode anchor not found on this build — skipping")
+            }
+            if (amoledResolverState != "absent") {
+                runCatching {
+                    AmoledThemeHook.installViewResolverCached(
+                        this, methods[AmoledThemeHook.CACHE_KEY].orEmpty())
+                }.onFailure { L.e(TAG, "AMOLED view resolver installation failed", it) }
+            } else {
+                L.i(TAG, "AMOLED view resolver not found on this build — skipping")
             }
             if (refreshState != "absent") {
                 runCatching {
@@ -469,6 +546,31 @@ class ModuleMain : XposedModule() {
                 runCatching {
                     DownloadHook.installMediaSetupCached(this, classLoader, it)
                 }.onFailure { L.e(TAG, "Media-setup hook installation failed", it) }
+            }
+            if (contextualStoryState != "absent") {
+                runCatching {
+                    ContextualDownloadHook.installStoryCached(
+                        this, methods[ContextualDownloadHook.STORY_CACHE_KEY].orEmpty())
+                }.onFailure { L.e(TAG, "Contextual story download installation failed", it) }
+            }
+            if (!ContextualDownloadHook.isReelAbsent(contextualReelState)) {
+                val installed = runCatching {
+                    ContextualDownloadHook.installReelsCached(
+                        this,
+                        classLoader,
+                        methods[ContextualDownloadHook.REEL_CACHE_KEY].orEmpty(),
+                        contextualReelState,
+                    )
+                }.onFailure { L.e(TAG, "Contextual reel download installation failed", it) }
+                    .getOrDefault(false)
+                if (!installed) {
+                    // Other hooks are already active: rescanning everything
+                    // right here could duplicate them. Invalidate just this
+                    // sentinel so the next Facebook process does a clean
+                    // full scan instead of silently skipping reels forever.
+                    L.w(TAG, "Cached reel hook failed; rediscovering on next Facebook start")
+                    MethodCache.invalidateClass(context, ContextualDownloadHook.REEL_CACHE_KEY)
+                }
             }
             if (videoPlayerState != "absent") {
                 runCatching {
@@ -612,6 +714,14 @@ class ModuleMain : XposedModule() {
                 darkMethods = DarkModeHook.install(this, bridge, classLoader)
             }.onFailure { L.e(TAG, "Dark-mode hook installation failed", it) }
 
+            // Morphe AMOLED route 1: discover the obfuscated FDS resolver
+            // reached by ordinary Android Views from stable FdsColorScheme.
+            var amoledResolverMethods: List<Method>? = null
+            runCatching {
+                amoledResolverMethods =
+                    AmoledThemeHook.discoverViewResolver(this, bridge, classLoader)
+            }.onFailure { L.e(TAG, "AMOLED view resolver discovery failed", it) }
+
             // M2.9: News Feed auto-refresh block (mod's AdjzonOq installer on
             // the four refresh trigger methods, gated on swNewsFeedAutoReload —
             // each blocker skips the original entirely).
@@ -643,6 +753,13 @@ class ModuleMain : XposedModule() {
                 mediaSetupClass = DownloadHook.installMediaSetup(this, bridge, classLoader)
             }.onFailure { L.e(TAG, "Media-setup hook installation failed", it) }
 
+            // Morphe-style native download actions. Stories reuse Facebook's
+            // Save row; reels append a real button to Facebook's own sidebar.
+            var contextualDownloads: ContextualDownloadHook.Result? = null
+            runCatching {
+                contextualDownloads = ContextualDownloadHook.install(this, bridge, classLoader)
+            }.onFailure { L.e(TAG, "Contextual download installation failed", it) }
+
             // M5: video playback trio, resume + background arms (mod:
             // qV2f0EclUxE76gtr3YEb + nlYTzRDfkAYF5jojqBcx). Both hook the
             // same player controller (X.4Qc = FbGrootPlayer, found via the
@@ -671,8 +788,7 @@ class ModuleMain : XposedModule() {
             }.onFailure { L.e(TAG, "Video playback hooks installation failed", it) }
 
             // Ported ad guards from the pre-rewrite module: marketplace ads,
-            // game ads/rewards, the CSR-experiment feed filter and the reels
-            // "Shop now" shopping cards. Each hook owns its own discovery +
+            // game ads/rewards, and the CSR-experiment feed filter. Each owns discovery +
             // install and returns its class-map entry for the shared
             // discovery cache.
             val marketplaceCacheEntry =
@@ -681,8 +797,6 @@ class ModuleMain : XposedModule() {
                 GameAdsHook.installAndCache(this, bridge, classLoader, context)
             val feedGuardCacheEntry =
                 FeedGuardHook.installAndCache(this, bridge, classLoader, context)
-            val reelsShoppingCacheEntry =
-                ReelsShoppingHook.installAndCache(this, bridge, classLoader, context)
 
             // Cache everything so the next launch of this FB version skips the
             // minutes-long DexKit scan and installs hooks in ~1s.
@@ -693,20 +807,40 @@ class ModuleMain : XposedModule() {
                         storyViewerMethods?.let { put(StoryFeedViewerHook.CACHE_KEY, it) }
                         hideSeenMethods?.let { put(HideSeenStoryHook.CACHE_KEY, it) }
                         darkMethods?.let { put(DarkModeHook.CACHE_KEY, it) }
+                        amoledResolverMethods?.let { put(AmoledThemeHook.CACHE_KEY, it) }
                         autoRefreshMethods?.let { put(AutoRefreshHook.CACHE_KEY, it) }
                         trayMethods?.let { put(StoriesTrayHook.CACHE_KEY, it) }
+                        contextualDownloads?.storyMethods?.let {
+                            put(ContextualDownloadHook.STORY_CACHE_KEY, it)
+                        }
+                        contextualDownloads?.reelMethods?.let {
+                            put(ContextualDownloadHook.REEL_CACHE_KEY, it)
+                        }
                     },
                     buildMap {
                         runnableClass?.let { put("feed.processNewStories", it) }
                         adsOptOutClass?.let { put(AdsOptOutHook.CACHE_KEY, it) }
                         playerClass?.let { put(DownloadHook.CACHE_KEY, it) }
                         mediaSetupClass?.let { put(DownloadHook.MEDIA_CACHE_KEY, it) }
+                        put(
+                            ContextualDownloadHook.STORY_CACHE_KEY,
+                            if (contextualDownloads?.storyMethods != null)
+                                ContextualDownloadHook.STORY_CACHE_VERSION
+                            else "absent",
+                        )
+                        put(
+                            ContextualDownloadHook.REEL_CACHE_KEY,
+                            contextualDownloads?.reelMetadata
+                                ?: ContextualDownloadHook.reelDiscoveryFailedEntry(),
+                        )
                         videoPlayerClass?.let { put(VideoResumeHook.CACHE_KEY, it) }
                         // "absent" records a NOT_FOUND anchor so later launches
                         // skip the hook instead of rescanning forever.
                         put(StoryFeedViewerHook.CACHE_KEY, if (storyViewerMethods != null) "cached" else "absent")
                         put(HideSeenStoryHook.CACHE_KEY, if (hideSeenMethods != null) "cached" else "absent")
                         put(DarkModeHook.CACHE_KEY, if (darkMethods != null) "cached" else "absent")
+                        put(AmoledThemeHook.CACHE_KEY,
+                            if (amoledResolverMethods != null) "cached" else "absent")
                         put(AutoRefreshHook.CACHE_KEY, if (autoRefreshMethods != null) "cached" else "absent")
                         put(StoriesTrayHook.CACHE_KEY, if (trayMethods != null) "cached" else "absent")
                         // The resume key holds the class NAME (like the
@@ -723,7 +857,6 @@ class ModuleMain : XposedModule() {
                         put(MarketplaceAdsHook.CACHE_KEY, marketplaceCacheEntry)
                         put(GameAdsHook.CACHE_KEY, gameAdsCacheEntry)
                         put(FeedGuardHook.CACHE_KEY, feedGuardCacheEntry)
-                        put(ReelsShoppingHook.CACHE_KEY, reelsShoppingCacheEntry)
                     },
                 )
                 L.i(TAG, "Discovery results cached for this FB version")

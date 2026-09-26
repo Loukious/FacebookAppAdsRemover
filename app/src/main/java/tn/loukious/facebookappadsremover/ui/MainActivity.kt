@@ -8,13 +8,15 @@ import android.widget.Toast
 import android.view.Gravity
 import android.view.ViewGroup
 import android.widget.LinearLayout
-import android.widget.Switch
 import android.widget.TextView
 import androidx.appcompat.app.AlertDialog
 import androidx.appcompat.app.AppCompatActivity
+import com.google.android.material.color.DynamicColors
+import com.google.android.material.materialswitch.MaterialSwitch
 import tn.loukious.facebookappadsremover.R
 import tn.loukious.facebookappadsremover.core.SessionBackup
 import tn.loukious.facebookappadsremover.core.Settings
+import tn.loukious.facebookappadsremover.core.AdSettingsMigration
 import io.github.libxposed.service.XposedService
 import io.github.libxposed.service.XposedServiceHelper
 
@@ -57,6 +59,11 @@ class MainActivity : AppCompatActivity() {
     ) { uri -> onSessionFilePicked(uri) }
 
     override fun onCreate(savedInstanceState: Bundle?) {
+        // Activity-only: never change Facebook's process/theme from the module.
+        // Apply BEFORE AppCompat inflates the ActionBar, views and dialogs.
+        // On Android < 12 or unsupported builds this is a no-op; the M3
+        // DayNight theme supplies its own accessible fallback colors.
+        DynamicColors.applyToActivityIfAvailable(this)
         super.onCreate(savedInstanceState)
         setContentView(R.layout.activity_main)
 
@@ -85,6 +92,7 @@ class MainActivity : AppCompatActivity() {
             override fun onServiceBind(service: XposedService) {
                 prefs = runCatching { service.getRemotePreferences(Settings.NAME) }.getOrNull()
                 migrateFromLocalStorage()
+                migrateSplitAdToggles()
                 runOnUiThread { onServiceReady() }
             }
 
@@ -147,7 +155,31 @@ class MainActivity : AppCompatActivity() {
         }
     }
 
-    private val rows = HashMap<String, Switch>()
+    /**
+     * The previous Block ads setting was a master gate over feed, video,
+     * stories, Marketplace and games. Convert it once into independent surface
+     * preferences so an existing disabled master stays disabled after upgrade.
+     * A user can then enable any individual ad family without the old master
+     * overriding their choice. The retired Reels shopping setting is removed.
+     */
+    private fun migrateSplitAdToggles() {
+        val remote = prefs ?: return
+        runCatching {
+            val updates = AdSettingsMigration.updates(remote.all)
+            if (updates.isEmpty() && !remote.contains(AdSettingsMigration.RETIRED_SHOPPING)) {
+                return
+            }
+            remote.edit().apply {
+                for ((key, value) in updates) putBoolean(key, value)
+                remove(AdSettingsMigration.RETIRED_SHOPPING)
+                remove(Settings.LEGACY_ADS_ENABLED)
+            }.apply()
+        }.onFailure {
+            android.util.Log.w("FBAR.Settings", "Ad toggle migration failed", it)
+        }
+    }
+
+    private val rows = HashMap<String, MaterialSwitch>()
     private var keywordInput: android.widget.EditText? = null
 
     /**
@@ -291,7 +323,7 @@ class MainActivity : AppCompatActivity() {
      * itself is a small target). Callers own the switch's initial state,
      * enabled state and listener.
      */
-    private fun buildToggleRow(parent: ViewGroup, title: String, subtitle: String): Switch {
+    private fun buildToggleRow(parent: ViewGroup, title: String, subtitle: String): MaterialSwitch {
         val row = LinearLayout(this)
         row.orientation = LinearLayout.HORIZONTAL
         row.gravity = Gravity.CENTER_VERTICAL
@@ -313,7 +345,9 @@ class MainActivity : AppCompatActivity() {
         text.addView(subtitleView)
         row.addView(text)
 
-        val switch = Switch(this)
+        // MaterialSwitch reads Material 3 colorPrimary/onSurface, including
+        // Monet wallpaper colors after DynamicColors applies its overlay.
+        val switch = MaterialSwitch(this)
         row.addView(switch)
 
         // Whole row toggles, not just the small switch target.

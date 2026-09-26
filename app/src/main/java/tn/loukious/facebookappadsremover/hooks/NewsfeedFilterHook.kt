@@ -1,6 +1,11 @@
 package tn.loukious.facebookappadsremover.hooks
 
 import android.content.Context
+import android.os.SystemClock
+import android.view.accessibility.AccessibilityNodeInfo
+import android.view.View
+import android.view.ViewGroup
+import android.widget.TextView
 import tn.loukious.facebookappadsremover.core.L
 import tn.loukious.facebookappadsremover.core.Settings
 import io.github.libxposed.api.XposedInterface
@@ -9,6 +14,8 @@ import org.luckypray.dexkit.DexKitBridge
 import org.luckypray.dexkit.query.enums.StringMatchType
 import java.lang.reflect.Field
 import java.lang.reflect.Method
+import java.util.Collections
+import java.util.WeakHashMap
 import java.util.concurrent.ConcurrentHashMap
 
 /**
@@ -50,8 +57,8 @@ object NewsfeedFilterHook {
 
     // Toggle keys live in core.Settings (defaults mirror the mod's ship
     // state: sponsored removal on, the content-type filters opt-in). The
-    // SPONSORED category rides the master ads toggle — one swHOME_ADS in
-    // the mod, one ads.enabled switch here.
+    // The original mod had one swHOME_ADS master; this port gates SPONSORED
+    // only on ads.newsFeed. Other feed categories have independent switches.
 
     private const val EDGE_CLASS = "com.facebook.graphql.model.GraphQLFeedUnitEdge"
     private const val CATEGORY_ENUM = "com.crossapp.graphql.facebook.enums.GraphQLFeedStoryCategory"
@@ -62,16 +69,9 @@ object NewsfeedFilterHook {
     private const val RUNNABLE_ANCHOR = "Added stories to FUC"
 
     @Volatile private var appClassLoader: ClassLoader? = null
+    @Volatile private var uiFallbackInstalled = false
 
-    /** Category enum name → toggle key (the mod's map, see class doc). */
-    private val categoryPrefs = mapOf(
-        "SPONSORED" to Settings.ADS_ENABLED,
-        "PROMOTION" to Settings.FEED_THREADS,
-        "FB_SHORTS" to Settings.FEED_REELS,
-        "ENGAGEMENT" to Settings.FEED_SUGGESTIONS,
-        "ENGAGEMENT_QP" to Settings.FEED_PYMK,
-        "MULTI_FB_STORIES_TRAY" to Settings.FEED_STORIES,
-    )
+    private const val AI_UI_LABEL = "AI content"
 
     /** Resolved-once reflection members (the mod cached its field lookups too). */
     private var edgeClass: Class<*>? = null
@@ -81,6 +81,7 @@ object NewsfeedFilterHook {
     private val collectionFieldCache = ConcurrentHashMap<Class<*>, Field>()
     private val categoryGetterMisses = ConcurrentHashMap.newKeySet<Class<*>>()
     private val collectionFieldMisses = ConcurrentHashMap.newKeySet<Class<*>>()
+    private var aiScanBatches = 0
 
     fun init(context: Context) {
         appClassLoader = context.classLoader
@@ -91,10 +92,40 @@ object NewsfeedFilterHook {
                 ", aiContent=$ai, keywords=${if (kw.isEmpty()) "(none)" else kw.size}")
     }
 
-    private fun enabledCategories(): Set<String> =
-        // Mod ship state: only sponsored removal ON; the content-type filters
-        // (threads/reels/suggestions/PYMK) are opt-in.
-        categoryPrefs.filterValues { Settings.getBoolean(it, it == Settings.ADS_ENABLED) }.keys
+    /**
+     * Semantic fallback for already-restored/cached feed rows that can bypass
+     * processNewStories. Facebook 580 exposes the disclosure as an accessibility
+     * label (`AI content`) inside the top-level RecyclerView item. Hooking the
+     * stable AndroidX lifecycle keeps this independent of obfuscated X.* names.
+     */
+    @Synchronized
+    fun installUiFallback(
+        module: XposedInterface,
+        classLoader: ClassLoader,
+    ): Boolean {
+        if (uiFallbackInstalled) return true
+        val recycler = runCatching {
+            Class.forName("androidx.recyclerview.widget.RecyclerView", false, classLoader)
+        }.getOrNull() ?: return false
+        val onLayout = recycler.declaredMethods.firstOrNull {
+            it.name == "onLayout" && it.parameterCount == 5
+        } ?: return false
+        return runCatching {
+            onLayout.isAccessible = true
+            module.hook(onLayout).intercept(AiUiFallbackHook)
+            View::class.java.getDeclaredMethod(
+                "setContentDescription", CharSequence::class.java,
+            ).let { module.hook(it).intercept(AiDescriptionHook) }
+            uiFallbackInstalled = true
+            L.i(TAG, "AI-content UI fallback installed (RecyclerView layout + semantic label)")
+            true
+        }.getOrElse {
+            L.w(TAG, "AI-content UI fallback hook failed", it)
+            false
+        }
+    }
+
+    private fun enabledCategories(): Set<String> = FeedContentRules.enabledCategoryNames()
 
     /** The keyword list, split on commas/semicolons/newlines, lowercased. */
     private fun keywordList(): List<String> =
@@ -103,9 +134,14 @@ object NewsfeedFilterHook {
             .map { it.trim().lowercase() }
             .filter { it.isNotEmpty() }
 
-    /** True when the keyword filter is switched on with at least one keyword. */
-    private fun keywordsEnabled(): Boolean =
-        Settings.getBoolean(Settings.FEED_KEYWORDS_ENABLED, false) && keywordList().isNotEmpty()
+    /** Classic-feed adapter: rules live in FeedContentRules, not this hook. */
+    private val classicSignals = object : FeedItemSignals {
+        override fun category(item: Any): String? = categoryOf(item)
+        override fun sponsored(item: Any): Boolean = categoryOf(item) == "SPONSORED"
+        override fun aiContent(item: Any): Boolean = AiTransparencyInspector.isAiContent(item)
+        override fun searchableText(item: Any): String? =
+            runCatching { item.toString() }.getOrNull()
+    }
 
     /**
      * Finds the processNewStories Runnable class via DexKit and hooks its
@@ -147,6 +183,8 @@ object NewsfeedFilterHook {
         }
         runCatching {
             module.hook(run).intercept(FilterHook)
+            FeedFilterDiagnostics.installed(FeedPipeline.CLASSIC)
+            FeedFilterDiagnostics.scheduleHealth()
             L.i(TAG, "hooked processNewStories Runnable: $className.run()")
         }.onFailure {
             L.w(TAG, "hook failed on $className.run()", it)
@@ -162,6 +200,7 @@ object NewsfeedFilterHook {
      */
     private object FilterHook : Hooker {
         override fun intercept(chain: XposedInterface.Chain): Any? {
+            FeedFilterDiagnostics.invoked(FeedPipeline.CLASSIC)
             runCatching { filterCollection(chain.thisObject) }
                 .onFailure { L.w(TAG, "feed filter pass failed", it) }
             return chain.proceed()
@@ -170,10 +209,9 @@ object NewsfeedFilterHook {
 
     /** @return true if anything was removed. */
     private fun filterCollection(runnable: Any?): Boolean {
-        val enabled = enabledCategories()
+        val engine = FeedContentRules.engine(FeedPipeline.CLASSIC, classicSignals)
         val aiOn = Settings.getBoolean(Settings.FEED_AI_CONTENT, false)
-        val keywords = if (keywordsEnabled()) keywordList() else emptyList()
-        if (enabled.isEmpty() && !aiOn && keywords.isEmpty()) return false
+        if (!engine.active) return false
 
         val holderField = findHolderField(runnable ?: return false) ?: return false
         val holder = runCatching { holderField.get(runnable) }.getOrNull() ?: return false
@@ -182,25 +220,22 @@ object NewsfeedFilterHook {
         val elements = (collection as? Iterable<*>)?.toList() ?: return false
         if (elements.isEmpty()) return false
 
-        val kept = ArrayList<Any>(elements.size)
-        val removed = HashMap<String, Int>()
-        for (e in elements) {
-            if (e == null) continue
-            val category = categoryOf(e)
-            when {
-                category != null && category in enabled ->
-                    removed[category] = (removed[category] ?: 0) + 1
-                aiOn && AiCheck.isAiContent(e) ->
-                    removed["AI_CONTENT"] = (removed["AI_CONTENT"] ?: 0) + 1
-                keywords.isNotEmpty() && matchesKeywords(e, keywords) ->
-                    removed["KEYWORD"] = (removed["KEYWORD"] ?: 0) + 1
-                else -> kept.add(e)
+        val partition = engine.partition(elements)
+        FeedFilterDiagnostics.batch(FeedPipeline.CLASSIC, partition)
+        val removed = partition.removedByRule
+        if (aiOn) {
+            aiScanBatches++
+            val aiMatches = removed["AI_CONTENT"] ?: 0
+            if (aiMatches > 0 || aiScanBatches <= 8 || aiScanBatches % 50 == 0) {
+                L.i(TAG, "AI main scan batch=$aiScanBatches " +
+                    "inspected=${partition.evaluatedByRule["AI_CONTENT"] ?: 0} " +
+                    "matched=$aiMatches totalEdges=${elements.size}")
             }
         }
         if (removed.isEmpty()) return false
 
         val copy = copyOfMethod()?.let { m ->
-            runCatching { m.invoke(null, kept as Iterable<*>) }.getOrNull()
+            runCatching { m.invoke(null, partition.kept as Iterable<*>) }.getOrNull()
         }
         if (copy != null) {
             runCatching { collectionField.set(holder, copy) }.onFailure {
@@ -210,20 +245,9 @@ object NewsfeedFilterHook {
         } else {
             return false
         }
-        L.i(TAG, "removed ${removed.values.sum()}/${elements.size} row(s): " +
+        L.i(TAG, "removed ${partition.removed}/${elements.size} row(s): " +
                 removed.entries.joinToString { "${it.key}=${it.value}" })
         return true
-    }
-
-    /**
-     * Keyword match: the TreeJNI toString() dump of the edge carries the whole
-     * story tree (message text, attachment titles…), so a case-insensitive
-     * contains() over it is obfuscation-proof. Only runs for rows that passed
-     * the category filters, and only when keywords are configured.
-     */
-    private fun matchesKeywords(edge: Any, keywords: List<String>): Boolean {
-        val text = runCatching { edge.toString().lowercase() }.getOrNull() ?: return false
-        return keywords.any { text.contains(it) }
     }
 
     /**
@@ -315,136 +339,252 @@ object NewsfeedFilterHook {
         return m
     }
 
-    /**
-     * AI-content marker check — same TreeJNI technique as AdFilterHook's
-     * sponsored_data test.
-     *
-     * The flag hash is -1133610173 = String.hashCode("was_self_disclosed_as_
-     * ai_generated"), a field of the gen-AI transparency model (C717744h in
-     * 576.0.0.42.73, "renamed from: X.44h"). The verified consumer pattern
-     * (C5IO.java:202-204):
-     *
-     *     C717744h m = graphQLStory.A0Y();
-     *     if (m != null) z = m.getCachedBoolean(-1133610173);
-     *
-     * Names drift per release, so the model is reached structurally: from the
-     * feed edge, follow no-arg getters whose return type is a TreeJNI model
-     * (its hierarchy declares hasFieldValue(int)); two levels deep covers the
-     * known chain edge → story-holder (C44g, four typed getters on the edge)
-     * → transparency model. hasFieldValue(hash) is false on models that don't
-     * own the field, so probing wrong branches is harmless — the exact
-     * property AdFilterHook.SponsoredCheck relies on.
-     */
-    private object AiCheck {
-        /** String.hashCode("was_self_disclosed_as_ai_generated"). */
-        private const val AI_HASH = -1133610173
+    /** UI-only safety net; shared data-layer AI classification lives in AiTransparencyInspector. */
+    private data class HiddenRowState(
+        val height: Int,
+        val visibility: Int,
+    )
 
-        /** Visited-object cap — the walk is bounded even on surprise shapes. */
-        private const val MAX_VISIT = 60
+    private object AiUiFallbackHook : Hooker {
+        private const val MAX_DESCENDANTS = 320
+        private const val MAX_VIRTUAL_NODES = 480
+        private const val MAX_UNLINKED_VIRTUAL_IDS = 48
+        private val childIdMethod = runCatching {
+            AccessibilityNodeInfo::class.java.getDeclaredMethod(
+                "getChildId", Int::class.javaPrimitiveType,
+            ).also { it.isAccessible = true }
+        }.getOrNull()
+        private val hiddenRows = Collections.synchronizedMap(WeakHashMap<View, HiddenRowState>())
+        @Volatile private var lastScanLogMs = 0L
 
-        /** Optional.empty = "checked, no hasFieldValue method" (ConcurrentHashMap holds no nulls). */
-        private val hasFieldValueCache = ConcurrentHashMap<Class<*>, java.util.Optional<Method>>()
-
-        /** TreeJNI-model getters per class, resolved once. */
-        private val modelGetterCache = ConcurrentHashMap<Class<*>, List<Method>>()
-
-        /**
-         * Root class → the getter chain that reached the transparency holder
-         * (edge getter → holder getter). Once found, later rows walk only the
-         * cached path instead of re-probing every branch.
-         */
-        private val pathCache = ConcurrentHashMap<Class<*>, List<Method>>()
-
-        fun isAiContent(root: Any?): Boolean {
-            if (root == null) return false
-            pathCache[root.javaClass]?.let { path ->
-                if (runPath(root, path)) return true
-                // Path went stale (shape change mid-run?) — fall through to a
-                // fresh walk so the cache can be rebuilt.
-                pathCache.remove(root.javaClass)
-            }
-            val path = ArrayList<Method>()
-            return walk(root, root.javaClass, path, HashSet())
+        private class UiScan {
+            var providers = 0
+            var virtualNodes = 0
+            var virtualMatches = 0
+            var hostChildren = 0
+            var resolvedChildren = 0
+            var resolvedUnlinked = 0
         }
 
-        private fun runPath(root: Any, path: List<Method>): Boolean {
-            var obj: Any = root
-            for (m in path) {
-                obj = runCatching { m.invoke(obj) }.getOrNull() ?: return false
+        private val detachRestore = object : View.OnAttachStateChangeListener {
+            override fun onViewAttachedToWindow(v: View) = Unit
+
+            override fun onViewDetachedFromWindow(v: View) {
+                restoreRow(v)
             }
-            return hasFlag(obj)
         }
 
-        /** Depth-first walk over TreeJNI-model getters; records the path on success. */
-        private fun walk(obj: Any, rootClass: Class<*>, path: MutableList<Method>, seen: MutableSet<Any>): Boolean {
-            if (seen.size > MAX_VISIT || !seen.add(obj)) return false
-            if (isSkippable(obj)) return false
-            if (hasFlag(obj)) {
-                if (path.isNotEmpty()) pathCache[rootClass] = ArrayList(path)
-                return true
+        override fun intercept(chain: XposedInterface.Chain): Any? {
+            val result = chain.proceed()
+            val recycler = chain.thisObject as? ViewGroup ?: return result
+            if (!looksLikeMainFeedRecycler(recycler)) return result
+            // Do not create Litho accessibility nodes during mount/layout: that
+            // can mutate Facebook's accessibility tree while it is assembling.
+            // Query already-mounted virtual nodes on the next idle frame only.
+            recycler.postDelayed({
+                if (recycler.isAttachedToWindow) scanRecycler(recycler)
+            }, 650L)
+            return result
+        }
+
+        private fun scanRecycler(recycler: ViewGroup) {
+            val enabled = Settings.getBoolean(Settings.FEED_AI_CONTENT, false)
+            val scan = UiScan()
+            var matched = 0
+            for (i in 0 until recycler.childCount) {
+                val row = recycler.getChildAt(i)
+                if (enabled && hiddenRows.containsKey(row)) continue
+                if (enabled && containsAiDisclosure(row, scan)) {
+                    matched++
+                    hideRow(row)
+                } else {
+                    restoreRow(row)
+                }
             }
-            if (path.size >= 2) return false // edge → holder → transparency model
-            for (m in modelGetters(obj.javaClass)) {
-                val v = runCatching { m.invoke(obj) }.getOrNull() ?: continue
-                path.add(m)
-                if (walk(v, rootClass, path, seen)) return true
-                path.removeAt(path.lastIndex)
+            val now = SystemClock.uptimeMillis()
+            if (enabled && now - lastScanLogMs >= 10000) {
+                lastScanLogMs = now
+                L.i(TAG, "AI UI scan rows=${recycler.childCount} matches=$matched " +
+                    "providers=${scan.providers} virtualNodes=${scan.virtualNodes} " +
+                    "hostChildren=${scan.hostChildren} resolvedChildren=${scan.resolvedChildren} " +
+                    "resolvedUnlinked=${scan.resolvedUnlinked} virtualMatches=${scan.virtualMatches} " +
+                    "childIdAvailable=${childIdMethod != null}")
+            }
+        }
+
+        fun onDescription(view: View, description: String?) {
+            if (!Settings.getBoolean(Settings.FEED_AI_CONTENT, false) || !isAiLabel(description)) return
+            val (recycler, row) = findEnclosingFeedRow(view) ?: return
+            L.i(TAG, "AI content label on real View: ${view.javaClass.name}")
+            recycler.post {
+                if (row.parent === recycler && containsAiDisclosure(row)) hideRow(row)
+            }
+        }
+
+        private fun findEnclosingFeedRow(view: View): Pair<ViewGroup, View>? {
+            var child: View = view
+            repeat(36) {
+                val parent = child.parent as? ViewGroup ?: return null
+                if (inheritsFrom(parent, "androidx.recyclerview.widget.RecyclerView")) {
+                    return if (looksLikeMainFeedRecycler(parent)) parent to child else null
+                }
+                child = parent
+            }
+            return null
+        }
+
+        private fun looksLikeMainFeedRecycler(view: View): Boolean {
+            val dm = view.resources.displayMetrics
+            if (view.width < dm.widthPixels * 9 / 10 || view.height < dm.heightPixels * 7 / 10) {
+                return false
+            }
+            var parent = view.parent
+            repeat(12) {
+                val p = parent ?: return@repeat
+                if (inheritsFrom(p, "androidx.viewpager.widget.ViewPager")) return true
+                parent = p.parent
             }
             return false
         }
 
-        /** hasFieldValue(AI_HASH) == true — set and non-default (true). */
-        private fun hasFlag(obj: Any): Boolean {
-            val m = hasFieldValueOf(obj.javaClass) ?: return false
-            return runCatching { m.invoke(obj, AI_HASH) as? Boolean }.getOrDefault(false) == true
-        }
-
-        private fun hasFieldValueOf(cls: Class<*>): Method? {
-            hasFieldValueCache[cls]?.let { return it.orElse(null) }
-            var c: Class<*>? = cls
-            var found: Method? = null
-            while (c != null && found == null) {
-                val cur: Class<*> = c
-                found = runCatching {
-                    cur.getDeclaredMethod("hasFieldValue", Int::class.javaPrimitiveType)
-                }.getOrNull()
-                c = cur.superclass
+        private fun inheritsFrom(instance: Any, className: String): Boolean {
+            var cls: Class<*>? = instance.javaClass
+            while (cls != null) {
+                if (cls.name == className) return true
+                cls = cls.superclass
             }
-            hasFieldValueCache[cls] = java.util.Optional.ofNullable(found)
-            return found?.also { it.isAccessible = true }
+            return false
         }
 
-        /** No-arg instance getters returning another TreeJNI model. */
-        private fun modelGetters(cls: Class<*>): List<Method> {
-            modelGetterCache[cls]?.let { return it }
-            val result = ArrayList<Method>()
-            var c: Class<*>? = cls
-            while (c != null) {
-                for (m in c.declaredMethods) {
-                    if (m.parameterCount != 0) continue
-                    if (java.lang.reflect.Modifier.isStatic(m.modifiers)) continue
-                    if (m.isSynthetic || m.isBridge) continue
-                    if (m.returnType == cls || !isTreeModel(m.returnType)) continue
-                    m.isAccessible = true
-                    result.add(m)
+        private fun containsAiDisclosure(root: View, scan: UiScan = UiScan()): Boolean {
+            val stack = ArrayDeque<View>()
+            stack.add(root)
+            var visited = 0
+            while (stack.isNotEmpty() && visited++ < MAX_DESCENDANTS) {
+                val view = stack.removeLast()
+                if (isAiLabel(view.contentDescription?.toString())) return true
+                if (view is TextView && isAiLabel(view.text?.toString())) return true
+                // Facebook's LithoViews expose the AI badge as virtual
+                // accessibility nodes, not View children. This is the same
+                // semantic tree visible in `uiautomator dump`.
+                if (containsVirtualAiDisclosure(view, scan)) return true
+                if (view is ViewGroup) {
+                    for (i in 0 until view.childCount) stack.add(view.getChildAt(i))
                 }
-                c = c.superclass
             }
-            modelGetterCache[cls] = result
-            return result
+            return false
         }
 
-        /** A TreeJNI model: its hierarchy declares hasFieldValue(int). */
-        private fun isTreeModel(cls: Class<*>): Boolean =
-            !cls.isPrimitive && cls != Void.TYPE &&
-                cls.name.let { it.startsWith("com.facebook") || it.startsWith("p000X") } &&
-                hasFieldValueOf(cls) != null
+        private fun containsVirtualAiDisclosure(view: View, scan: UiScan): Boolean {
+            if (scan.virtualNodes >= MAX_VIRTUAL_NODES) return false
+            val provider = runCatching { view.accessibilityNodeProvider }.getOrNull()
+                ?: return false
+            scan.providers++
+            val host = runCatching {
+                provider.createAccessibilityNodeInfo(View.NO_ID)
+            }.getOrNull() ?: return false
+            val pending = ArrayDeque<AccessibilityNodeInfo>()
+            pending.add(host)
+            scan.hostChildren += host.childCount
+            if (host.childCount == 0) {
+                // Some Litho providers expose virtual nodes but don't link
+                // them from HOST_VIEW_ID when queried in-process. Their IDs
+                // are normally small local integers. Probe only a bounded
+                // set and only on already-mounted feed rows.
+                for (virtualId in 0 until MAX_UNLINKED_VIRTUAL_IDS) {
+                    if (scan.virtualNodes + pending.size >= MAX_VIRTUAL_NODES) break
+                    runCatching { provider.createAccessibilityNodeInfo(virtualId) }
+                        .getOrNull()?.let {
+                            pending.add(it)
+                            scan.resolvedUnlinked++
+                        }
+                }
+            }
+            while (pending.isNotEmpty() && scan.virtualNodes < MAX_VIRTUAL_NODES) {
+                val node = pending.removeLast()
+                scan.virtualNodes++
+                try {
+                    if (isAiLabel(node.text?.toString()) ||
+                        isAiLabel(node.contentDescription?.toString())
+                    ) {
+                        scan.virtualMatches++
+                        // Recycle any queued nodes before returning.
+                        while (pending.isNotEmpty()) recycleNode(pending.removeLast())
+                        return true
+                    }
+                    val childCount = node.childCount.coerceAtMost(80)
+                    for (i in 0 until childCount) {
+                        val child = runCatching { node.getChild(i) }.getOrNull()
+                            ?: virtualChild(provider, node, i)
+                        if (child != null) {
+                            scan.resolvedChildren++
+                            pending.add(child)
+                        }
+                    }
+                } finally {
+                    recycleNode(node)
+                }
+            }
+            while (pending.isNotEmpty()) recycleNode(pending.removeLast())
+            return false
+        }
 
-        /** Value types we never reflect into. */
-        private fun isSkippable(obj: Any): Boolean {
-            val n = obj.javaClass.name
-            return n.startsWith("java.") || n.startsWith("android.") ||
-                n.startsWith("kotlin.") || n.startsWith("com.google.")
+        private fun virtualChild(
+            provider: android.view.accessibility.AccessibilityNodeProvider,
+            parent: AccessibilityNodeInfo,
+            index: Int,
+        ): AccessibilityNodeInfo? {
+            val method = childIdMethod ?: return null
+            val childId = runCatching { method.invoke(parent, index) as? Long }.getOrNull()
+                ?: return null
+            // AccessibilityNodeInfo.makeNodeId packs the virtual descendant
+            // into the low 32 bits of the child node's long source ID.
+            val virtualId = childId.toInt()
+            return runCatching { provider.createAccessibilityNodeInfo(virtualId) }.getOrNull()
+        }
+
+        @Suppress("DEPRECATION")
+        private fun recycleNode(node: AccessibilityNodeInfo) {
+            runCatching { node.recycle() }
+        }
+
+        private fun isAiLabel(value: String?): Boolean {
+            val text = value?.trim().orEmpty()
+            return text.equals(AI_UI_LABEL, ignoreCase = true) ||
+                text.startsWith("$AI_UI_LABEL•", ignoreCase = true) ||
+                text.startsWith("$AI_UI_LABEL ·", ignoreCase = true)
+        }
+
+        private fun hideRow(row: View) {
+            if (hiddenRows.containsKey(row)) return
+            val lp = row.layoutParams ?: return
+            hiddenRows[row] = HiddenRowState(lp.height, row.visibility)
+            row.addOnAttachStateChangeListener(detachRestore)
+            lp.height = 0
+            row.layoutParams = lp
+            row.visibility = View.GONE
+            row.requestLayout()
+            L.i(TAG, "UI fallback hid AI-content feed row")
+        }
+
+        private fun restoreRow(row: View) {
+            val state = hiddenRows.remove(row) ?: return
+            row.removeOnAttachStateChangeListener(detachRestore)
+            row.layoutParams?.let { lp ->
+                lp.height = state.height
+                row.layoutParams = lp
+            }
+            row.visibility = state.visibility
+            row.requestLayout()
+        }
+    }
+
+    private object AiDescriptionHook : Hooker {
+        override fun intercept(chain: XposedInterface.Chain): Any? {
+            val result = chain.proceed()
+            val view = chain.thisObject as? View ?: return result
+            AiUiFallbackHook.onDescription(view, chain.args.getOrNull(0)?.toString())
+            return result
         }
     }
 }
