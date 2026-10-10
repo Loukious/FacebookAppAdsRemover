@@ -113,6 +113,9 @@ object Settings {
      *  encrypted-pref read also defaulted FALSE. */
     const val LINKS_CLEAN_URL = "links.cleanUrl"
 
+    /** Open outbound web links in the default external browser. Default ON. */
+    const val LINKS_EXTERNAL_BROWSER = "links.externalBrowser"
+
     /** News Feed auto-refresh block (mod: swNewsFeedAutoReload). */
     const val FEED_AUTO_REFRESH_BLOCK = "feed.autoRefreshBlock"
 

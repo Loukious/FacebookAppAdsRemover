@@ -166,6 +166,12 @@ val TOGGLE_SECTIONS: List<ToggleSection> = listOf(
     )),
     ToggleSection("Links", listOf(
         ToggleSpec(
+            Settings.LINKS_EXTERNAL_BROWSER,
+            "Open links in external browser",
+            "Open web links in your default browser; Facebook pages and login flows stay in the app",
+            true,
+        ),
+        ToggleSpec(
             Settings.LINKS_CLEAN_URL,
             "Unwrap l.php redirect links",
             "Rewrites facebook.com/l.php?u=…&fbclid=… URLs to the real destination before the browser opens them",

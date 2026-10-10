@@ -17,6 +17,7 @@ import tn.loukious.facebookappadsremover.hooks.AmoledThemeHook
 import tn.loukious.facebookappadsremover.hooks.AutoRefreshHook
 import tn.loukious.facebookappadsremover.hooks.BackgroundPlaybackHook
 import tn.loukious.facebookappadsremover.hooks.CleanUrlHook
+import tn.loukious.facebookappadsremover.hooks.ExternalBrowserHook
 import tn.loukious.facebookappadsremover.hooks.ContextualDownloadHook
 import tn.loukious.facebookappadsremover.hooks.DownloadHook
 import tn.loukious.facebookappadsremover.hooks.DarkModeHook
@@ -198,6 +199,9 @@ class ModuleMain : XposedModule() {
         // O1EMPB7OWX4fymeZ5Qom, swFbclid gate). Toggle is read in-callback.
         runCatching { CleanUrlHook.install(this) }
             .onFailure { L.e(TAG, "Clean-URL hook failed", it) }
+
+        runCatching { ExternalBrowserHook.install(this, context) }
+            .onFailure { L.e(TAG, "External-browser hook failed", it) }
 
         // Session export/import (ShareAccounts port): the module app's buttons
         // drive this receiver; it copies FB's authentication/logged_in session
