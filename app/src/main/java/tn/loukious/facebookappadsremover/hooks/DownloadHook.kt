@@ -2119,7 +2119,14 @@ object DownloadHook {
 
         val rows = ArrayList<LinearLayout>()
         val titles = ArrayList<TextView>()
-        val list = LinearLayout(activity).apply { orientation = LinearLayout.VERTICAL }
+        val list = LinearLayout(activity).apply {
+            orientation = LinearLayout.VERTICAL
+            // The summary scrolls with the options so it cannot crowd out the actions.
+            addView(TextView(activity).apply {
+                text = "Choose a quality to preview or download • ${items.size} options"
+                setPadding(dp(16), dp(8), dp(16), dp(8))
+            })
+        }
         // Selection render: highlight + a ✓ on the selected row so the tap
         // feedback is unambiguous in both light and dark themes.
         fun renderSelection(idx: Int) {
@@ -2147,16 +2154,16 @@ object DownloadHook {
 
         fun actionButton(label: String, onClick: () -> Unit) = TextView(activity).apply {
             text = label; textSize = 13f; typeface = Typeface.DEFAULT_BOLD
+            gravity = Gravity.CENTER
+            minHeight = dp(48)
+            isFocusable = true
             setPadding(dp(14), dp(8), dp(14), dp(8))
             background = GradientDrawable().apply {
                 cornerRadius = density * 8; setStroke(dp(1), 0x33808080)
             }
             setOnClickListener { runCatching { onClick() } }
         }
-        val actions = LinearLayout(activity).apply {
-            orientation = LinearLayout.HORIZONTAL
-            gravity = Gravity.END
-            setPadding(dp(16), dp(6), dp(16), dp(6))
+        val actions = QuickDownloadDialogLayout.ActionBar(activity).apply {
             addView(actionButton("Copy URL") {
                 val cm = activity.getSystemService(Context.CLIPBOARD_SERVICE)
                         as ClipboardManager
@@ -2178,30 +2185,19 @@ object DownloadHook {
                                 .addFlags(Intent.FLAG_ACTIVITY_NEW_TASK))
                     }
                 }
-            }, LinearLayout.LayoutParams(
-                LinearLayout.LayoutParams.WRAP_CONTENT,
-                LinearLayout.LayoutParams.WRAP_CONTENT).apply { leftMargin = dp(6) })
+            })
             addView(actionButton("Download") { // quick_link.action.download
                 dialog?.dismiss()
                 onQualitySelected(activity, items[selected.get()], audioUrl)
-            }, LinearLayout.LayoutParams(
-                LinearLayout.LayoutParams.WRAP_CONTENT,
-                LinearLayout.LayoutParams.WRAP_CONTENT).apply { leftMargin = dp(6) })
+            })
         }
 
         // Preselect the HD row (mod loop, libnc.so.c 1071982).
         renderSelection(selected.get())
 
-        val content = LinearLayout(activity).apply {
-            orientation = LinearLayout.VERTICAL
-            addView(ScrollView(activity).apply { addView(list) }, LinearLayout.LayoutParams(
-                ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT))
-            addView(actions, LinearLayout.LayoutParams(
-                ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT))
-        }
+        val content = QuickDownloadDialogLayout(activity, list, actions)
         dialog = AlertDialog.Builder(activity)
             .setTitle("QUICK VIDEO DOWNLOAD") // quick_link.dialog.title
-            .setMessage("Choose a quality to preview or download • ${items.size} options")
             .setView(content) // quick_link.dialog.summary_format
             .show()
     }
