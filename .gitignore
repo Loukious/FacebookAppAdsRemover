@@ -11,6 +11,5 @@ app/release
 .cxx
 local.properties
 .kotlin/
-gradle/wrapper/
 *.log
 *.js

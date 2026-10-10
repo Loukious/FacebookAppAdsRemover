@@ -2,7 +2,7 @@
 
 An LSPosed/Xposed module for `com.facebook.katana` that removes ads using structural DexKit discovery plus guarded, version-specific fast paths.
 
-Original port target: Facebook `576.0.0.42.73`; development/device testing also covers `580.0.0.51.74`. Module `1.21` (versionCode 22). Discovery is primarily structural rather than based on hardcoded obfuscated class names, but an individual hook can still need revision after a Facebook update. Older versions (571 and below) are no longer supported.
+Original port target: Facebook `576.0.0.42.73`; development/device testing also covers `580.0.0.51.74`. Module `1.22` (versionCode 23). Discovery is primarily structural rather than based on hardcoded obfuscated class names, but an individual hook can still need revision after a Facebook update. Older versions (571 and below) are no longer supported.
 
 ## Features
 
@@ -45,6 +45,7 @@ Everything below is available from the module's settings app. The defaults shown
    - **Activity list (Intent dump)** — logs activities Facebook starts, including action, URI and extras.
 
 7. **Links**
+   - **Open links in external browser** *(ON by default)* — opens outbound web links in your default browser; Facebook pages and login flows stay in the app.
    - **Unwrap `l.php` redirect links** — rewrites Facebook tracking/redirect URLs to the real destination before opening them.
 
 8. **Downloader & Repost**
@@ -117,6 +118,8 @@ Allow screenshots and recording; block Facebook's own capture detection.
 Hide selected tab-bar entries without removing their destinations, or enable the activity-list logger to dump hidden activities Facebook starts.
 
 ### Links
+
+**Open links in external browser** replaces launches to Facebook's normal in-app browser activities before they open. It uses the default browser, or offers a browser picker when no default is set. Facebook link shims are unwrapped; Facebook, Messenger and Meta pages retain their in-app flows. If no browser is available, Facebook handles the link as usual. The switch defaults ON; explicitly saved preferences are preserved.
 
 Unwrap `facebook.com/l.php?u=…&fbclid=…` redirect links to the real destination before the browser opens them.
 
