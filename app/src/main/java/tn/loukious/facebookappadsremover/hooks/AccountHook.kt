@@ -7,7 +7,6 @@ import io.github.libxposed.api.XposedInterface
 import io.github.libxposed.api.XposedInterface.Hooker
 import org.json.JSONArray
 import java.lang.reflect.Field
-import java.lang.reflect.Method
 import java.lang.reflect.Modifier
 
 /**
@@ -36,9 +35,10 @@ import java.lang.reflect.Modifier
  *   mUsername             → FBUSERNAME     (pref only — no in-memory static)
  *   mUserId               → FBUSERID
  *
- * The mod re-captures on every call until the four in-memory statics
- * (xZw29/T7Puc/UuCRUj/s9sEFa = cookieJson/httpCookie/token/userId) are all
- * non-empty, then unhooks the method with one final refresh.
+ * The original mod waited for cookies, token and user ID before unhooking.
+ * Some Facebook builds never provide cookies, so this port finishes after
+ * capturing token/user ID and treats cookies and username as best-effort.
+ * Unchanged values produce no preference writes or update logs.
  *
  * Nothing here needs DexKit: ViewerContext is a stable com.facebook.* class
  * in the secondary dex (verified present with identical field names in stock
@@ -53,11 +53,11 @@ object AccountHook {
     private const val PREFS_NAME = "fbar_account"
 
     // Pref keys — the mod's app.telegram.bemai3012_* keys in parentheses.
-    const val KEY_USER_ID = "user_id"           // FBUSERID
-    const val KEY_USERNAME = "username"         // FBUSERNAME
-    const val KEY_AUTH_TOKEN = "auth_token"     // FBTOKEN
-    const val KEY_COOKIE_JSON = "cookie_json"   // FBFULLCOOKIE
-    const val KEY_COOKIE_HTTP = "cookie_http"   // FBHTTPCOOKIE
+    const val KEY_USER_ID = AccountCaptureState.KEY_USER_ID           // FBUSERID
+    const val KEY_USERNAME = AccountCaptureState.KEY_USERNAME         // FBUSERNAME
+    const val KEY_AUTH_TOKEN = AccountCaptureState.KEY_AUTH_TOKEN     // FBTOKEN
+    const val KEY_COOKIE_JSON = AccountCaptureState.KEY_COOKIE_JSON   // FBFULLCOOKIE
+    const val KEY_COOKIE_HTTP = AccountCaptureState.KEY_COOKIE_HTTP   // FBHTTPCOOKIE
 
     /** Stable secondary-dex class name (no discovery cache needed). */
     const val VIEWER_CONTEXT_CLASS = "com.facebook.auth.viewercontext.ViewerContext"
@@ -67,11 +67,25 @@ object AccountHook {
     /** The hooked equals() methods — unhooked once the capture is complete. */
     private val hookHandles = ArrayList<XposedInterface.HookHandle>()
 
-    /** In-memory statics — the mod's GhTa.xZw29/T7Puc/UuCRUj/s9sEFa. */
-    @Volatile private var cookieJson: String? = null
-    @Volatile private var cookieHttp: String? = null
-    @Volatile private var token: String? = null
-    @Volatile private var userId: String? = null
+    private val captureState = AccountCaptureState(
+        persist = { changed ->
+            runCatching {
+                val editor = prefs.edit()
+                for ((key, value) in changed) editor.putString(key, value)
+                editor.apply()
+            }.onFailure { L.w(TAG, "account preference update failed", it) }
+        },
+        log = { L.i(TAG, it) },
+        warn = { L.w(TAG, it) },
+        decodeCookies = ::jsonToHttpCookie,
+        onComplete = {
+            for (handle in hookHandles) {
+                runCatching { handle.unhook() }
+                    .onFailure { L.w(TAG, "Could not detach account hook; capture is disabled", it) }
+            }
+            hookHandles.clear()
+        },
+    )
 
     fun init(context: Context) {
         prefs = context.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
@@ -83,8 +97,9 @@ object AccountHook {
      * false quietly while the secondary dexes are not attached yet, so the
      * caller can retry on the same cadence as the discovery probe.
      */
+    @Synchronized
     fun install(module: XposedInterface, classLoader: ClassLoader): Boolean {
-        if (hookHandles.isNotEmpty()) return true
+        if (captureState.completed || hookHandles.isNotEmpty()) return true
         val cls = runCatching {
             Class.forName(VIEWER_CONTEXT_CLASS, false, classLoader)
         }.getOrNull() ?: return false
@@ -109,6 +124,9 @@ object AccountHook {
             }.onFailure { L.w(TAG, "field missing: $name", it) }
         }
 
+        // Publish fields before enabling any callback. Installation and
+        // capture share a lock so completion cannot race handle registration.
+        this.fields = fields
         var installed = 0
         for (m in targets) {
             runCatching {
@@ -120,7 +138,6 @@ object AccountHook {
             }.onFailure { L.w(TAG, "hook failed on ${cls.name}.${m.name}", it) }
         }
         if (installed == 0) return false
-        this.fields = fields
         return true
     }
 
@@ -138,60 +155,16 @@ object AccountHook {
         }
     }
 
-    /** The capture blocks (libnc.so.c 108510–109455). */
+    /** Capture changed fields and detach once the required credentials exist. */
+    @Synchronized
     private fun capture(viewerContext: Any?) {
-        if (viewerContext == null) return
-
-        // mSessionCookiesString → cookieJson + FBFULLCOOKIE, then the JSON
-        // array walked into an HTTP Cookie header → cookieHttp + FBHTTPCOOKIE.
-        stringField(viewerContext, "mSessionCookiesString")?.let { raw ->
-            val sanitized = raw.replace('\n', ' ').replace('\r', ' ').replace('\t', ' ')
-            if (sanitized.isNotBlank()) {
-                cookieJson = sanitized
-                put(KEY_COOKIE_JSON, sanitized)
-                jsonToHttpCookie(sanitized)?.let { http ->
-                    cookieHttp = http
-                    put(KEY_COOKIE_HTTP, http)
-                    L.i(TAG, "ViewerContext FullCookie updated (json=${sanitized.length} chars, http=${http.length} chars)")
-                } ?: L.w(TAG, "ViewerContext FullCookie updated (json only; HTTP conversion failed)")
-            }
-        }
-
-        // mAuthToken → FBTOKEN.
-        stringField(viewerContext, "mAuthToken")?.let { v ->
-            if (v.isNotBlank()) {
-                token = v
-                put(KEY_AUTH_TOKEN, v)
-                L.i(TAG, "ViewerContext Token updated (${mask(v)})")
-            }
-        }
-
-        // mUsername → FBUSERNAME (pref only, like the mod).
-        stringField(viewerContext, "mUsername")?.let { v ->
-            if (v.isNotBlank()) {
-                put(KEY_USERNAME, v)
-                L.i(TAG, "ViewerContext UserName updated ($v)")
-            }
-        }
-
-        // mUserId → FBUSERID.
-        stringField(viewerContext, "mUserId")?.let { v ->
-            if (v.isNotBlank()) {
-                userId = v
-                put(KEY_USER_ID, v)
-                L.i(TAG, "ViewerContext UserId updated ($v)")
-            }
-        }
-
-        // The mod unhooks once all four statics are populated (after a final
-        // refresh, which this very call just performed).
-        if (!cookieJson.isNullOrEmpty() && !cookieHttp.isNullOrEmpty() &&
-            !token.isNullOrEmpty() && !userId.isNullOrEmpty()
-        ) {
-            L.i(TAG, "account capture complete — unhooking equals()")
-            for (h in hookHandles) runCatching { h.unhook() }
-            hookHandles.clear()
-        }
+        if (viewerContext == null || captureState.completed) return
+        captureState.capture(AccountCaptureState.Snapshot(
+            token = stringField(viewerContext, "mAuthToken"),
+            userId = stringField(viewerContext, "mUserId"),
+            username = stringField(viewerContext, "mUsername"),
+            cookies = stringField(viewerContext, "mSessionCookiesString"),
+        ))
     }
 
     /**
@@ -201,7 +174,7 @@ object AccountHook {
      * FBTOKEN pref). Blank/null = "no token" to callers.
      */
     fun authToken(): String? =
-        token?.takeIf { it.isNotBlank() }
+        captureState.authToken?.takeIf { it.isNotBlank() }
             ?: if (this::prefs.isInitialized) {
                 runCatching { prefs.getString(KEY_AUTH_TOKEN, "") }.getOrNull()
                     ?.takeIf { it.isNotBlank() }
@@ -229,11 +202,4 @@ object AccountHook {
         (f.get(obj) as? String)
     }.getOrNull()
 
-    private fun put(key: String, value: String) {
-        runCatching { prefs.edit().putString(key, value).apply() }
-            .onFailure { L.w(TAG, "pref write failed: $key", it) }
-    }
-
-    /** Never log secrets in full — length plus a short head is enough to verify. */
-    private fun mask(s: String): String = "${s.length} chars, ${s.take(4)}…"
 }
