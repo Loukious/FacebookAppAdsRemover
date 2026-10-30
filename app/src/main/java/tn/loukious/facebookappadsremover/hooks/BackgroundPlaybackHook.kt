@@ -114,6 +114,7 @@ object BackgroundPlaybackHook {
      *  arrives before the counter can reach 0). */
     private val startedActivities = AtomicInteger(0)
     @Volatile private var lastActivityPausedAt = 0L
+    private var foregroundTrackerRegistered = false
 
     @Volatile private var manualPauseConstant: Any? = null
     @Volatile private var manualPauseResolved = false
@@ -148,7 +149,7 @@ object BackgroundPlaybackHook {
                 className: String, context: Context,
                 pauseNames: List<String> = emptyList()): Boolean {
         if (hookHandles.isNotEmpty()) return true
-        registerForegroundTracker(context)
+        init(context)
         val cls = runCatching {
             Class.forName(className, false, classLoader)
         }.getOrNull() ?: run {
@@ -217,7 +218,10 @@ object BackgroundPlaybackHook {
                       pauseNames: List<String> = emptyList()): Boolean =
         install(module, classLoader, className, context, pauseNames)
 
-    private fun registerForegroundTracker(context: Context) {
+    /** Register before discovery starts so the first activity is counted too. */
+    @Synchronized
+    fun init(context: Context) {
+        if (foregroundTrackerRegistered) return
         val app = context as? Application ?: context.applicationContext as? Application
         if (app == null) {
             L.w(TAG, "no Application context — foreground tracker disabled")
@@ -247,6 +251,7 @@ object BackgroundPlaybackHook {
                 override fun onActivitySaveInstanceState(activity: android.app.Activity, outState: android.os.Bundle) {}
                 override fun onActivityDestroyed(activity: android.app.Activity) {}
             })
+            foregroundTrackerRegistered = true
         }.onFailure { L.w(TAG, "foreground tracker registration failed", it) }
     }
 

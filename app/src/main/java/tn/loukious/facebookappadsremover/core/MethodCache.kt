@@ -35,27 +35,43 @@ object MethodCache {
         if (prefs.getInt(KEY_SCHEMA, -1) != CACHE_SCHEMA) return null
         if (prefs.getInt(KEY_MODULE_VERSION, -1) != BuildConfig.VERSION_CODE) return null
         val all = prefs.getString(KEY_TARGETS, null) ?: return null
+        return decodeMethods(all, classLoader).also { methods ->
+            if (methods == null) {
+                android.util.Log.w("FBAR.Cache", "Stale or malformed cached methods (forcing rediscovery)")
+            }
+        }
+    }
+
+    /** Empty is a valid completed scan; null means a stale or malformed snapshot. */
+    internal fun decodeMethods(all: String, classLoader: ClassLoader): Map<String, List<Method>>? {
         val out = mutableMapOf<String, List<Method>>()
         for (line in all.split('\n')) {
             if (line.isBlank()) continue
             val idx = line.indexOf('=')
-            if (idx <= 0) continue
+            if (idx <= 0) return null
             val methods = mutableListOf<Method>()
-            for (spec in line.substring(idx + 1).split(';')) {
+            // Object-array type names contain a semicolon too ([LType;).
+            // That terminator precedes either a parameter comma or the real
+            // method separator. Preserve it when reading existing caches.
+            for (spec in line.substring(idx + 1).split(Regex(";(?=[^,;]|$)"))) {
                 if (spec.isBlank()) continue
                 val method = resolveMethod(spec, classLoader)
                 if (method == null) {
                     // An obfuscated name/parameter change must not silently
                     // degrade a 4-method hook family to an unrelated subset.
-                    android.util.Log.w("FBAR.Cache", "Stale cached method: " +
-                        line.substring(0, idx) + " (forcing rediscovery)")
                     return null
                 }
                 methods.add(method)
             }
-            if (methods.isNotEmpty()) out[line.substring(0, idx)] = methods
+            // The writer omits empty roles. A nonblank row without methods
+            // is incomplete data, not a completed scan with no targets.
+            if (methods.isEmpty()) return null
+            out[line.substring(0, idx)] = methods
         }
-        return if (out.isEmpty()) null else out
+        // Class-only hooks and explicit "absent" outcomes still constitute a
+        // complete cache. Requiring a Method here repeats discovery forever
+        // on Facebook builds where none of the method anchors resolve.
+        return out
     }
 
     /** Cached auxiliary class name (e.g. the newsfeed filter Runnable). */
@@ -80,6 +96,20 @@ object MethodCache {
             android.util.Log.w("FBAR.Cache", "Unknown Facebook version; skipping cache write")
             return
         }
+        val serialized = encodeMethods(methods)
+        val editor = context.getSharedPreferences(PREFS, Context.MODE_PRIVATE).edit()
+            // A complete discovery snapshot replaces any obsolete role keys.
+            // Partial overwrites previously let retired class:* keys survive.
+            .clear()
+            .putInt(KEY_VERSION, hostVersion)
+            .putInt(KEY_SCHEMA, CACHE_SCHEMA)
+            .putInt(KEY_MODULE_VERSION, BuildConfig.VERSION_CODE)
+            .putString(KEY_TARGETS, serialized)
+        for ((k, v) in classes) editor.putString(KEY_CLASS_PREFIX + k, v)
+        editor.apply()
+    }
+
+    internal fun encodeMethods(methods: Map<String, List<Method>>): String {
         val sb = StringBuilder()
         for ((key, list) in methods) {
             if (list.isEmpty()) continue
@@ -91,16 +121,7 @@ object MethodCache {
             }
             sb.append('\n')
         }
-        val editor = context.getSharedPreferences(PREFS, Context.MODE_PRIVATE).edit()
-            // A complete discovery snapshot replaces any obsolete role keys.
-            // Partial overwrites previously let retired class:* keys survive.
-            .clear()
-            .putInt(KEY_VERSION, hostVersion)
-            .putInt(KEY_SCHEMA, CACHE_SCHEMA)
-            .putInt(KEY_MODULE_VERSION, BuildConfig.VERSION_CODE)
-            .putString(KEY_TARGETS, sb.toString())
-        for ((k, v) in classes) editor.putString(KEY_CLASS_PREFIX + k, v)
-        editor.apply()
+        return sb.toString()
     }
 
     /** "Class#name:param,param" -> Method via the app classloader. */

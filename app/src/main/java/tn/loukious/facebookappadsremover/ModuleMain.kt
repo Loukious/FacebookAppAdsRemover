@@ -164,6 +164,12 @@ class ModuleMain : XposedModule() {
         // the 46-method hook-all stays cheap on the UI thread.)
         DownloadHook.init(context)
 
+        // Discovery now runs alongside the first activity. Count activity
+        // starts before it can finish and install the playback hooks; a late
+        // tracker would mistake that visible activity for a background app.
+        runCatching { BackgroundPlaybackHook.init(context) }
+            .onFailure { L.e(TAG, "Background-playback foreground tracker failed", it) }
+
         // Game ads: framework seams only (activity lifecycle closer, launch
         // blockers, JS-interface + script watchers) — they need no DexKit,
         // so they arm immediately and close the cold-start window before
