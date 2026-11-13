@@ -92,6 +92,12 @@ class ModuleMain : XposedModule() {
 
         L.i(TAG, "Facebook ready — hooking app onCreate")
 
+        // Authentication preferences live in the bootstrap dex. Observe the
+        // factory before onCreate can cache a ViewerContext; install() retries
+        // this observer later if the class is not yet available.
+        runCatching { AccountHook.installSessionSource(this, param.classLoader) }
+            .onFailure { L.w(TAG, "early account store observer failed", it) }
+
         val appClass = runCatching {
             Class.forName(APP_CLASS, false, param.classLoader)
         }.getOrNull()

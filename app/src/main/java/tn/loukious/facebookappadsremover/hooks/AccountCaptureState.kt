@@ -1,19 +1,13 @@
 package tn.loukious.facebookappadsremover.hooks
 
 /**
- * Thread-safe account capture that follows the signed-in account for the
- * whole process lifetime; cookies and username are best-effort.
- *
- * Credentials are only ever stored as a pair: a token is accepted together
- * with the user ID it was observed with, so a token can never end up
- * attributed to another account.
- *  - A new user ID (account switch) replaces the whole record; values of the
- *    previous account that the new snapshot does not provide are removed.
- *  - The same user ID with a different token (refresh/replacement) updates
- *    the token.
- *  - [clear] drops everything (logout).
- * Before the first complete pair is seen, partial values are stored as they
- * arrive, as before.
+ * Follows authoritative session state for the process lifetime. The caller
+ * reads that state inside its capture lock, immediately before [capture].
+ * Authentication snapshots can replace optional fields only when both credentials
+ * match the current pair; a retained context cannot change the account or restore
+ * an old token. A matching canonical snapshot's missing optional values remove
+ * earlier values, including when the pair is unchanged. Unknown authority performs
+ * no writes; logout clears.
  *
  * [persist] receives only changed keys; a null value means "remove".
  */
@@ -39,6 +33,14 @@ internal class AccountCaptureState(
         val cookies: String? = null,
     )
 
+    sealed interface Session {
+        data class SignedIn(val token: String, val userId: String) : Session {
+            init { require(token.isNotBlank() && userId.isNotBlank()) }
+        }
+        data object LoggedOut : Session
+        data object Unknown : Session
+    }
+
     /** True while a complete token + user ID pair is known. */
     @Volatile var completed = false
         private set
@@ -47,45 +49,57 @@ internal class AccountCaptureState(
 
     private val values = HashMap<String, String>()
     private var warnedMissingCookies = false
+    private var cleared = false
 
     @Synchronized
-    fun capture(snapshot: Snapshot) {
-        val token = snapshot.token?.takeIf { it.isNotBlank() }
-        val userId = snapshot.userId?.takeIf { it.isNotBlank() }
-        val pair = token != null && userId != null
-        val switching = pair && completed && userId != values[KEY_USER_ID]
-
-        // Once a pair is known, a snapshot can only change the account data
-        // when it carries a full pair: a lone token or ID can't be tied to
-        // an account, and username/cookies only belong to the pair's user.
-        if (completed && !pair) return
+    fun capture(snapshot: Snapshot, session: Session) {
+        val current = when (session) {
+            Session.Unknown -> return
+            Session.LoggedOut -> { clear(); return }
+            is Session.SignedIn -> session
+        }
+        val pairChanged = current.token != values[KEY_AUTH_TOKEN] || current.userId != values[KEY_USER_ID]
+        val accountChanged = completed && current.userId != values[KEY_USER_ID]
+        val matchingSample = snapshot.token == current.token && snapshot.userId == current.userId
 
         val changed = LinkedHashMap<String, String?>()
-        // On a switch every value is new, even one that happens to match the old account's.
-        fun old(key: String) = if (switching) null else values[key]
+        fun old(key: String) = if (pairChanged) null else values[key]
         fun update(key: String, value: String?) {
             if (!value.isNullOrBlank() && value != old(key)) changed[key] = value
         }
-
-        val cookies = snapshot.cookies?.replace('\n', ' ')?.replace('\r', ' ')?.replace('\t', ' ')
-        if (cookies.isNullOrBlank()) {
-            if (!warnedMissingCookies) {
-                warnedMissingCookies = true
-                warn("mSessionCookiesString empty — cookies are optional; capture uses token/user ID")
-            }
-        } else if (cookies != old(KEY_COOKIE_JSON)) {
-            update(KEY_COOKIE_JSON, cookies)
-            val http = decodeCookies(cookies)
-            if (!http.isNullOrBlank()) update(KEY_COOKIE_HTTP, http)
-            else warn("ViewerContext cookies unavailable as HTTP header; continuing with token/user ID")
+        fun optional(key: String, value: String?) {
+            if (value.isNullOrBlank()) {
+                if (values.containsKey(key)) changed[key] = null
+            } else update(key, value)
         }
-        update(KEY_AUTH_TOKEN, token)
-        update(KEY_USERNAME, snapshot.username)
-        update(KEY_USER_ID, userId)
 
-        if (switching) {
-            // Nothing of the previous account may survive the switch.
-            for (key in ALL_KEYS) if (key !in changed && values.containsKey(key)) changed[key] = null
+        // The authority supplies credentials even if the candidate context is stale.
+        update(KEY_AUTH_TOKEN, current.token)
+        update(KEY_USER_ID, current.userId)
+        if (matchingSample) {
+            optional(KEY_USERNAME, snapshot.username)
+            val cookies = snapshot.cookies?.replace('\n', ' ')?.replace('\r', ' ')?.replace('\t', ' ')
+            if (cookies.isNullOrBlank()) {
+                optional(KEY_COOKIE_JSON, null)
+                optional(KEY_COOKIE_HTTP, null)
+                if (!warnedMissingCookies) {
+                    warnedMissingCookies = true
+                    warn("authentication cookies empty — capture uses token/user ID")
+                }
+            } else if (cookies != old(KEY_COOKIE_JSON)) {
+                update(KEY_COOKIE_JSON, cookies)
+                val http = runCatching { decodeCookies(cookies) }.getOrNull()
+                if (!http.isNullOrBlank()) update(KEY_COOKIE_HTTP, http)
+                else {
+                    changed[KEY_COOKIE_HTTP] = null
+                    warn("authentication cookies unavailable as HTTP header; continuing with token/user ID")
+                }
+            }
+        }
+
+        if (pairChanged) {
+            // Include keys unknown to this process so older disk preferences are cleared too.
+            for (key in ALL_KEYS) if (key !in changed) changed[key] = null
         }
 
         if (changed.isNotEmpty()) {
@@ -93,26 +107,26 @@ internal class AccountCaptureState(
             // cannot turn the same equals() calls into a write/log retry loop.
             for ((key, value) in changed) if (value == null) values.remove(key) else values[key] = value
             authToken = values[KEY_AUTH_TOKEN]
-            persist(changed)
-            if (switching) log("ViewerContext account changed")
-            for ((key, value) in changed) if (value != null) log("ViewerContext $key updated")
-        }
-
-        if (!completed && !authToken.isNullOrBlank() && !values[KEY_USER_ID].isNullOrBlank()) {
+            cleared = false
+            val firstPair = !completed
             completed = true
-            log("account capture complete")
+            persist(changed)
+            if (accountChanged) log("authentication account changed")
+            for ((key, value) in changed) if (value != null) log("authentication session $key updated")
+            if (firstPair) log("authentication session captured")
         }
     }
 
     /** Logout: forget and remove every captured value. */
     @Synchronized
     fun clear() {
-        if (values.isEmpty() && !completed) return
-        val removed = values.keys.associateWith<String, String?> { null }
+        if (cleared) return
+        val removed = ALL_KEYS.associateWith<String, String?> { null }
         values.clear()
         authToken = null
         completed = false
-        if (removed.isNotEmpty()) persist(removed)
+        cleared = true
+        persist(removed)
         log("account credentials cleared")
     }
 }

@@ -6,9 +6,8 @@ import tn.loukious.facebookappadsremover.core.L
 import io.github.libxposed.api.XposedInterface
 import io.github.libxposed.api.XposedInterface.Hooker
 import org.json.JSONArray
-import java.io.File
-import java.lang.reflect.Field
 import java.lang.reflect.Modifier
+import android.os.SystemClock
 
 /**
  * M3 account tools — port of the original mod's ViewerContext installer
@@ -36,12 +35,11 @@ import java.lang.reflect.Modifier
  *   mUsername             → FBUSERNAME     (pref only — no in-memory static)
  *   mUserId               → FBUSERID
  *
- * The original mod unhooked after its first capture. This port keeps the
- * (sampled) hook so it follows account switches and token refreshes, stores
- * token and user ID only as a pair (see AccountCaptureState), skips page
- * contexts, and clears everything once Facebook's session file is gone
- * (logout). Cookies and username are best-effort; unchanged values produce
- * no preference writes or update logs.
+ * The sampled equals() hook is only a wake-up signal. Credentials come from
+ * an atomic snapshot of Facebook's current authentication store, fetched
+ * through its factory each time; retained ViewerContexts and replaced store
+ * objects cannot restore an old account. No persisted credentials are used
+ * until the current session is verified. See [AuthenticationStoreSource].
  *
  * Nothing here needs DexKit: ViewerContext is a stable com.facebook.* class
  * in the secondary dex (verified present with identical field names in stock
@@ -64,6 +62,7 @@ object AccountHook {
 
     /** Stable secondary-dex class name (no discovery cache needed). */
     const val VIEWER_CONTEXT_CLASS = "com.facebook.auth.viewercontext.ViewerContext"
+    private const val LIGHT_PREFS_CLASS = "com.facebook.crudolib.prefs.LightSharedPreferencesImpl"
 
     private lateinit var prefs: SharedPreferences
 
@@ -73,14 +72,11 @@ object AccountHook {
      * callback samples at most once per [SAMPLE_INTERVAL_MS].
      */
     private val hookHandles = ArrayList<XposedInterface.HookHandle>()
+    private val sourceHookHandles = ArrayList<XposedInterface.HookHandle>()
+    private val sessionSource = AuthenticationStoreSource()
 
     private const val SAMPLE_INTERVAL_MS = 2_000L
-    private const val LOGOUT_CHECK_INTERVAL_MS = 30_000L
-    @Volatile private var lastSample = 0L
-    @Volatile private var lastLogoutCheck = 0L
-
-    /** Facebook's active-session file; missing or empty means logged out. */
-    private var authFile: File? = null
+    @Volatile private var lastSample: Long? = null
 
     private val captureState = AccountCaptureState(
         persist = { changed ->
@@ -97,30 +93,66 @@ object AccountHook {
         decodeCookies = ::jsonToHttpCookie,
     )
 
+    @Synchronized
     fun init(context: Context) {
         prefs = context.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
-        authFile = runCatching {
-            File(context.dataDir, "app_light_prefs").walkTopDown().maxDepth(2)
-                .firstOrNull { it.isFile && it.name == "authentication" }
-        }.getOrNull()
-        // Credentials captured before a logout that happened while the
-        // process was dead must not survive into this session.
-        clearIfLoggedOut(force = true)
+        // A previous process's credentials are unverified, including when
+        // authentication never existed or disappeared while the app was dead.
+        captureState.clear()
+        refreshSession()
     }
 
-    private fun clearIfLoggedOut(force: Boolean = false) {
-        val now = System.currentTimeMillis()
-        if (!force && now - lastLogoutCheck < LOGOUT_CHECK_INTERVAL_MS) return
-        lastLogoutCheck = now
-        val loggedOut = authFile?.let { !it.isFile || it.length() == 0L }
-            // Never seen a session file: nothing to compare against.
-            ?: return
-        if (!loggedOut) return
-        captureState.clear()
-        if (this::prefs.isInitialized) {
-            // Also drop values persisted by an earlier process.
-            runCatching { prefs.edit().clear().apply() }
+    /**
+     * Install on the bootstrap class before Application.onCreate so the
+     * authentication factory is observed even if Facebook caches its context
+     * during startup. The getString hook also permits a later installation.
+     */
+    @Synchronized
+    fun installSessionSource(module: XposedInterface, classLoader: ClassLoader): Boolean {
+        if (sourceHookHandles.isNotEmpty()) return true
+        val cls = runCatching { Class.forName(LIGHT_PREFS_CLASS, false, classLoader) }
+            .getOrNull() ?: return false
+        val nameField = runCatching { cls.getDeclaredField("_name").apply { isAccessible = true } }
+            .getOrNull() ?: return false
+
+        // The Provider captures the factory whose String -> preferences
+        // getter returns its canonical entry, including replacements.
+        for (constructor in cls.declaredConstructors) {
+            val providerIndex = constructor.parameterTypes.indexOfFirst { it.name == "javax.inject.Provider" }
+            if (providerIndex < 0) continue
+            runCatching {
+                constructor.isAccessible = true
+                sourceHookHandles.add(module.hook(constructor).intercept(object : Hooker {
+                    override fun intercept(chain: XposedInterface.Chain): Any? {
+                        val result = chain.proceed()
+                        runCatching {
+                            if (nameField.get(chain.thisObject) == "authentication") {
+                                chain.args.getOrNull(providerIndex)?.let { sessionSource.observe(it, cls) }
+                            }
+                        }
+                        return result
+                    }
+                }))
+            }.onFailure { L.w(TAG, "authentication constructor hook failed", it) }
         }
+        runCatching {
+            val getter = cls.getDeclaredMethod("getString", String::class.java, String::class.java)
+            sourceHookHandles.add(module.hook(getter).intercept(object : Hooker {
+                override fun intercept(chain: XposedInterface.Chain): Any? {
+                    val result = chain.proceed()
+                    runCatching {
+                        val store = chain.thisObject
+                        if (store != null && nameField.get(store) == "authentication") {
+                            sessionSource.observeStore(store)
+                        }
+                    }
+                    return result
+                }
+            }))
+        }.onFailure { L.w(TAG, "authentication getter hook failed", it) }
+        if (sourceHookHandles.isEmpty()) return false
+        L.i(TAG, "authentication store observer installed")
+        return true
     }
 
     /**
@@ -131,6 +163,7 @@ object AccountHook {
      */
     @Synchronized
     fun install(module: XposedInterface, classLoader: ClassLoader): Boolean {
+        if (!installSessionSource(module, classLoader)) return false
         if (hookHandles.isNotEmpty()) return true
         val cls = runCatching {
             Class.forName(VIEWER_CONTEXT_CLASS, false, classLoader)
@@ -147,24 +180,6 @@ object AccountHook {
             return false
         }
 
-        val fields = HashMap<String, Field>(4)
-        for (name in listOf("mSessionCookiesString", "mAuthToken", "mUsername", "mUserId")) {
-            runCatching {
-                val f = cls.getDeclaredField(name)
-                f.isAccessible = true
-                fields[name] = f
-            }.onFailure { L.w(TAG, "field missing: $name", it) }
-        }
-        // Optional: page ("act as page") contexts carry the page's ID/token
-        // and must not replace the user's account.
-        runCatching {
-            cls.getDeclaredField(PAGE_CONTEXT_FIELD).also { it.isAccessible = true }
-        }.onSuccess { fields[PAGE_CONTEXT_FIELD] = it }
-            .onFailure { L.w(TAG, "no $PAGE_CONTEXT_FIELD; page contexts can't be filtered") }
-
-        // Publish fields before enabling any callback. Installation and
-        // capture share a lock so completion cannot race handle registration.
-        this.fields = fields
         var installed = 0
         for (m in targets) {
             runCatching {
@@ -179,8 +194,6 @@ object AccountHook {
         return true
     }
 
-    private var fields: Map<String, Field> = emptyMap()
-
     /**
      * bsrncODWYJ5TNENFG95a.beforeHookedMethod port: observe, capture, never
      * alter the original result.
@@ -189,45 +202,41 @@ object AccountHook {
         override fun intercept(chain: XposedInterface.Chain): Any? {
             // equals() runs constantly; sampling keeps the hook cheap while
             // still following account switches within a couple of seconds.
-            val now = System.currentTimeMillis()
-            if (now - lastSample >= SAMPLE_INTERVAL_MS) {
-                lastSample = now
-                runCatching { capture(chain.thisObject) }
+            val now = SystemClock.elapsedRealtime()
+            val last = lastSample
+            if (last == null || now - last >= SAMPLE_INTERVAL_MS) {
+                runCatching { sampleSession(now) }
                     .onFailure { L.w(TAG, "capture failed", it) }
             }
             return chain.proceed()
         }
     }
 
-    private const val PAGE_CONTEXT_FIELD = "mIsPageContext"
-
-    /** Capture changed fields of the signed-in user's ViewerContext. */
+    /** Serialize sampling with the fresh authority read and persistence. */
     @Synchronized
-    private fun capture(viewerContext: Any?) {
-        clearIfLoggedOut()
-        if (viewerContext == null) return
-        val isPage = fields[PAGE_CONTEXT_FIELD]?.let { runCatching { it.getBoolean(viewerContext) }.getOrNull() }
-        if (isPage == true) return
-        captureState.capture(AccountCaptureState.Snapshot(
-            token = stringField(viewerContext, "mAuthToken"),
-            userId = stringField(viewerContext, "mUserId"),
-            username = stringField(viewerContext, "mUsername"),
-            cookies = stringField(viewerContext, "mSessionCookiesString"),
-        ))
+    private fun sampleSession(now: Long) {
+        if (!this::prefs.isInitialized) return
+        if (lastSample?.let { now - it < SAMPLE_INTERVAL_MS } == true) return
+        lastSample = now
+        refreshSession()
     }
 
-    /**
-     * The captured Graph user token, for repost/page calls — in-memory static
-     * first, pref fallback (mod: pO4TjBxQp2IFO1UyrtSF.oA72A8FsG9IKF8BK7Lb,
-     * libnc.so.c 1319475–1319736 — static GhTa.UuCRUjLnvPR7SP3GNGo, then the
-     * FBTOKEN pref). Blank/null = "no token" to callers.
-     */
-    fun authToken(): String? =
-        captureState.authToken?.takeIf { it.isNotBlank() }
-            ?: if (this::prefs.isInitialized) {
-                runCatching { prefs.getString(KEY_AUTH_TOKEN, "") }.getOrNull()
-                    ?.takeIf { it.isNotBlank() }
-            } else null
+    private fun refreshSession(): Boolean {
+        if (!this::prefs.isInitialized) return false
+        val current = sessionSource.read()
+        captureState.capture(current.snapshot, current.session)
+        return current.session is AccountCaptureState.Session.SignedIn
+    }
+
+    /** Recheck authority at use time; never fall back to unverified prefs. */
+    @Synchronized
+    fun authToken(): String? = if (refreshSession()) captureState.authToken else null
+
+    /** Downloads must also stop using cached cookies after logout. */
+    @Synchronized
+    fun httpCookie(): String? = if (refreshSession()) {
+        prefs.getString(KEY_COOKIE_HTTP, null)?.takeIf { it.isNotBlank() }
+    } else null
 
     /**
      * S7VA.XS11PXyJIvbyHBPk0TZ(JSONArray) port (libnc.so.c 684239–684517):
@@ -244,11 +253,6 @@ object AccountHook {
             sb.append(c.getString("name")).append('=').append(c.getString("value"))
         }
         sb.toString().takeIf { it.isNotEmpty() }
-    }.getOrNull()
-
-    private fun stringField(obj: Any, name: String): String? = runCatching {
-        val f = fields[name] ?: return@runCatching null
-        (f.get(obj) as? String)
     }.getOrNull()
 
 }
