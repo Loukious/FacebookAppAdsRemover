@@ -18,8 +18,6 @@ import tn.loukious.facebookappadsremover.core.L
 import tn.loukious.facebookappadsremover.core.Settings
 import java.lang.reflect.Method
 import java.lang.ref.WeakReference
-import java.util.Collections
-import java.util.IdentityHashMap
 
 /**
  * Runtime port of Morphe's "[General] AMOLED black theme".
@@ -58,9 +56,7 @@ object AmoledThemeHook {
     // resolved, so future builds/accounts can supply their own exact value.
     private const val FALLBACK_SEPARATOR_COLOR = 0x192D88FF
 
-    private val hookedMethods = Collections.newSetFromMap(
-        IdentityHashMap<Method, Boolean>(),
-    )
+    private val hookedMethods = AmoledMethodRegistry()
 
     @Volatile private var frameworkInstalled = false
     @Volatile private var unreadNotificationColor = FALLBACK_SEPARATOR_COLOR
@@ -135,12 +131,12 @@ object AmoledThemeHook {
             cls.declaredMethods
                 .filter { it.returnType == Int::class.javaPrimitiveType }
                 .forEach { method ->
-                    if (hookedMethods.contains(method)) return@forEach
                     runCatching {
-                        method.isAccessible = true
-                        module.hook(method).intercept(ResolverResultHook)
-                        hookedMethods.add(method)
-                        newlyHooked++
+                        val installed = hookedMethods.installOnce(method) {
+                            method.isAccessible = true
+                            module.hook(method).intercept(ResolverResultHook)
+                        }
+                        if (installed) newlyHooked++
                     }.onFailure { L.w(TAG, "resolver hook failed: $method", it) }
                 }
         }
@@ -153,16 +149,16 @@ object AmoledThemeHook {
                             it.parameterTypes[0] == Canvas::class.java)
                 }
                 .forEach { method ->
-                    if (hookedMethods.contains(method)) return@forEach
-                    method.isAccessible = true
-                    val hooker = if (method.name == "onLayout") {
-                        FeedRecyclerLayoutHook
-                    } else {
-                        FeedRecyclerDrawHook
+                    val installed = hookedMethods.installOnce(method) {
+                        method.isAccessible = true
+                        val hooker = if (method.name == "onLayout") {
+                            FeedRecyclerLayoutHook
+                        } else {
+                            FeedRecyclerDrawHook
+                        }
+                        module.hook(method).intercept(hooker)
                     }
-                    module.hook(method).intercept(hooker)
-                    hookedMethods.add(method)
-                    newlyHooked++
+                    if (installed) newlyHooked++
                 }
         }.onFailure { L.w(TAG, "feed separator RecyclerView hook failed", it) }
         if (newlyHooked > 0) L.i(TAG, "AMOLED Facebook resolver methods installed: +$newlyHooked")
@@ -217,16 +213,17 @@ object AmoledThemeHook {
         return hookResolver(module, methods.single())
     }
 
+    @Synchronized
     private fun hookResolver(module: XposedInterface, method: Method): Boolean {
-        if (hookedMethods.contains(method)) return true
         if (method.returnType != Int::class.javaPrimitiveType || method.parameterCount != 2 ||
             method.parameterTypes[0] != android.content.Context::class.java ||
             !method.parameterTypes[1].isEnum
         ) return false
         return runCatching {
-            method.isAccessible = true
-            module.hook(method).intercept(ResolverResultHook)
-            hookedMethods.add(method)
+            hookedMethods.installOnce(method) {
+                method.isAccessible = true
+                module.hook(method).intercept(ResolverResultHook)
+            }
             true
         }.onFailure { L.w(TAG, "FDS view resolver hook failed: $method", it) }
             .getOrDefault(false)

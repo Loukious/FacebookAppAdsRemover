@@ -38,6 +38,7 @@ import io.github.libxposed.api.XposedModuleInterface.ModuleLoadedParam
 import io.github.libxposed.api.XposedModuleInterface.PackageLoadedParam
 import io.github.libxposed.api.XposedModuleInterface.PackageReadyParam
 import org.luckypray.dexkit.DexKitBridge
+import tn.loukious.facebookappadsremover.core.ProcessFilter
 import java.io.File
 import java.lang.reflect.Method
 import kotlin.concurrent.thread
@@ -69,8 +70,11 @@ class ModuleMain : XposedModule() {
         private const val APP_CLASS = "com.facebook.katana.app.FacebookApplication"
     }
 
+    private var processName: String? = null
+
     override fun onModuleLoaded(param: ModuleLoadedParam) {
         L.module = this
+        processName = param.processName
         L.i(TAG, "Module loaded in process: ${param.processName}")
     }
 
@@ -81,6 +85,10 @@ class ModuleMain : XposedModule() {
     override fun onPackageReady(param: PackageReadyParam) {
         if (!param.isFirstPackage) return
         if (param.packageName != FACEBOOK_PACKAGE) return
+        if (ProcessFilter.isSkipped(processName)) {
+            L.i(TAG, "Skipping background process $processName — no UI to patch")
+            return
+        }
 
         L.i(TAG, "Facebook ready — hooking app onCreate")
 
