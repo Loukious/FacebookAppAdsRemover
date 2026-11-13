@@ -262,8 +262,11 @@ class MainActivity : AppCompatActivity() {
     }
 
     private fun sendSession(action: String) {
+        val nonce = SessionResultReceiver.newRequestNonce(this)
         val intent = Intent(action).setPackage("com.facebook.katana")
+            .putExtra(SessionBackup.EXTRA_NONCE, nonce)
         val sent = runCatching { sendBroadcast(intent) }.isSuccess
+        if (!sent) SessionResultReceiver.cancelRequestNonce(this, nonce)
         Toast.makeText(
             this,
             if (sent) "Asking Facebook…" else "Broadcast failed — is Facebook installed?",
@@ -286,12 +289,15 @@ class MainActivity : AppCompatActivity() {
             Toast.makeText(this, "That doesn't look like a session export", Toast.LENGTH_LONG).show()
             return
         }
+        val nonce = SessionResultReceiver.newRequestNonce(this)
         val intent = Intent(SessionBackup.ACTION_IMPORT_DATA)
             .setPackage("com.facebook.katana")
             .putExtra(SessionBackup.EXTRA_DATA, text)
+            .putExtra(SessionBackup.EXTRA_NONCE, nonce)
         runCatching { sendBroadcast(intent) }
             .onSuccess { Toast.makeText(this, "Asking Facebook…", Toast.LENGTH_SHORT).show() }
             .onFailure {
+                SessionResultReceiver.cancelRequestNonce(this, nonce)
                 Toast.makeText(this, "Broadcast failed — is Facebook installed?", Toast.LENGTH_SHORT).show()
             }
     }

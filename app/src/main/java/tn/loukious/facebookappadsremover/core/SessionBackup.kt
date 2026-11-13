@@ -66,6 +66,9 @@ object SessionBackup {
     const val ACTION_IMPORT_DATA = "tn.loukious.facebookappadsremover.action.SESSION_IMPORT_DATA"
     const val EXTRA_DATA = "data"
 
+    /** Signature permission (declared by the module app) required to send the actions above. */
+    const val SENDER_PERMISSION = "tn.loukious.facebookappadsremover.permission.SESSION_BACKUP"
+
     /**
      * Result action sent back to the module app (foreground while the buttons
      * are pressed, so its toasts actually display — FB is backgrounded and
@@ -86,21 +89,30 @@ object SessionBackup {
      * app_light_prefs/.../dbl_local_auth_<uid>    — per-account credentials
      * app_config_experiment/logged_in_user_ids    — registry of signed-in uids
      */
-    private const val AUTH_FILE = "authentication"
-    private val SESSION_PREFIXES = arrayOf("logged_in_", "dbl_local_auth_")
 
     /** Session-file search bound: FB's data dir is deep, but not that deep. */
     private const val MAX_WALK_DEPTH = 6
 
+    /** Per-request token from the module app, echoed in [ACTION_RESULT]. */
+    const val EXTRA_NONCE = "nonce"
+    private val requestNonce = ThreadLocal<String?>()
+
     private val receiver = object : BroadcastReceiver() {
         override fun onReceive(ctx: Context, intent: Intent) {
             val app = ctx.applicationContext
+            // Echoed back with the result so the module app only shows replies
+            // to requests it actually sent.
+            val nonce = intent.getStringExtra(EXTRA_NONCE)
+            fun run(name: String, work: () -> Unit) = Thread {
+                requestNonce.set(nonce)
+                work()
+            }.apply { this.name = name }.start()
             when (intent.action) {
-                ACTION_EXPORT -> Thread { exportSession(app) }.apply { name = "fbar-session-export" }.start()
-                ACTION_IMPORT -> Thread { importLatest(app) }.apply { name = "fbar-session-import" }.start()
-                ACTION_IMPORT_DATA -> Thread {
+                ACTION_EXPORT -> run("fbar-session-export") { exportSession(app) }
+                ACTION_IMPORT -> run("fbar-session-import") { importLatest(app) }
+                ACTION_IMPORT_DATA -> run("fbar-session-import") {
                     importData(app, intent.getStringExtra(EXTRA_DATA))
-                }.apply { name = "fbar-session-import" }.start()
+                }
             }
         }
     }
@@ -113,10 +125,13 @@ object SessionBackup {
                 addAction(ACTION_IMPORT)
                 addAction(ACTION_IMPORT_DATA)
             }
+            // The receiver lives in Facebook's process and can read or overwrite
+            // its session: only senders holding the module's signature
+            // permission (i.e. the module app itself) may trigger it.
             if (Build.VERSION.SDK_INT >= 33) {
-                context.registerReceiver(receiver, filter, Context.RECEIVER_EXPORTED)
+                context.registerReceiver(receiver, filter, SENDER_PERMISSION, null, Context.RECEIVER_EXPORTED)
             } else {
-                context.registerReceiver(receiver, filter)
+                context.registerReceiver(receiver, filter, SENDER_PERMISSION, null)
             }
             L.i(TAG, "session backup receiver registered")
         }.onFailure { L.e(TAG, "session backup receiver registration failed", it) }
@@ -150,9 +165,9 @@ object SessionBackup {
             .put("exported_at", System.currentTimeMillis())
             .put("user_id", account.getString(AccountHook.KEY_USER_ID, null) ?: JSONObject.NULL)
             .put("username", account.getString(AccountHook.KEY_USERNAME, null) ?: JSONObject.NULL)
-            .put("auth_token", account.getString(AccountHook.KEY_AUTH_TOKEN, null) ?: JSONObject.NULL)
-            .put("cookie_json", account.getString(AccountHook.KEY_COOKIE_JSON, null) ?: JSONObject.NULL)
-            .put("cookie_http", account.getString(AccountHook.KEY_COOKIE_HTTP, null) ?: JSONObject.NULL)
+            // The captured token/cookies are not written: import never reads
+            // them, and a file in shared Downloads should not carry more
+            // credentials than the session files themselves.
             // relative-path -> base64 content; import writes each back verbatim.
             .put("files", payload)
 
@@ -210,7 +225,11 @@ object SessionBackup {
         val keys = files.keys()
         while (keys.hasNext()) {
             val rel = keys.next()
-            val target = File(dataDir, rel)
+            val target = SessionPaths.sessionTarget(dataDir, rel)
+            if (target == null) {
+                L.e(TAG, "import skip (not a session file path): $rel")
+                continue
+            }
             if (target.parentFile?.exists() != true) {
                 L.e(TAG, "import skip (no parent dir): $rel")
                 continue
@@ -248,7 +267,7 @@ object SessionBackup {
         context.dataDir.walkTopDown()
             .maxDepth(MAX_WALK_DEPTH)
             .filter {
-                it.isFile && (it.name == AUTH_FILE || SESSION_PREFIXES.any { p -> it.name.startsWith(p) })
+                it.isFile && SessionPaths.isSessionFileName(it.name)
             }
             .mapNotNull { f -> relativeTo(f, context)?.let { rel -> rel to f } }
             .toMap()
@@ -321,6 +340,7 @@ object SessionBackup {
                 .setPackage("tn.loukious.facebookappadsremover")
                 .putExtra(EXTRA_OK, ok)
                 .putExtra(EXTRA_MESSAGE, message)
+                .putExtra(EXTRA_NONCE, requestNonce.get())
             context.sendBroadcast(intent)
         }
     }
