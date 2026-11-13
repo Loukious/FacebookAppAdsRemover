@@ -202,13 +202,7 @@ object GameAdsHook {
     )
 
     /** Zero-arg callback names that mark a rewarded ad as completed. */
-    private val AUDIENCE_NETWORK_REWARD_COMPLETION_METHOD_NAMES = setOf(
-        "onRewardedVideoCompleted",
-        "onRewardedAdCompleted",
-        "onRewardedInterstitialCompleted",
-        "onAdComplete",
-        "onAdCompleted"
-    )
+    private val AUDIENCE_NETWORK_REWARD_COMPLETION_METHOD_NAMES = GameRewardCallbacks.completionNames
 
     /** DexKit anchors — log literals inside the native request handlers. */
     private val GAME_AD_METHOD_TAGS = listOf(
@@ -784,6 +778,12 @@ object GameAdsHook {
                 .onFailure { L.w(TAG, "result hooks failed for ${bridgeClass.name}", it) }
             runCatching { hookServiceDispatchMethods(module, bridgeClass) }
                 .onFailure { L.w(TAG, "service dispatch hooks failed for ${bridgeClass.name}", it) }
+            GamePromiseResolver.find(bridgeObject, JSONObject::class.java)?.let { endpoint ->
+                if (endpoint.owner !== bridgeObject) {
+                    hookResultMethods(module, endpoint.owner.javaClass)
+                    L.i(TAG, "game promise endpoint ${bridgeClass.name} -> ${endpoint.owner.javaClass.name}")
+                }
+            }
         }
     }
 
@@ -1031,7 +1031,7 @@ object GameAdsHook {
 
     private fun tryHookAudienceNetworkRewardClass(module: XposedInterface, clazz: Class<*>) {
         val className = clazz.name
-        if (!isAudienceNetworkRewardRelevantClass(className) ||
+        if (!isAudienceNetworkRewardRelevantClass(clazz) ||
             !audienceNetworkRewardClassesHooked.add(className)
         ) {
             return
@@ -1040,12 +1040,20 @@ object GameAdsHook {
         var hooked = 0
         val methods = runCatching { clazz.declaredMethods + clazz.methods }
             .getOrDefault(emptyArray())
-        methods.distinctBy { method ->
-            method.name + method.parameterTypes.joinToString(prefix = "(", postfix = ")") { it.name }
-        }.forEach { method ->
+            .filter { method -> !Modifier.isAbstract(method.modifiers) }
+            .sortedBy { method -> method.isBridge }
+            .distinctBy { method ->
+                method.name + method.parameterTypes.joinToString(prefix = "(", postfix = ")") { it.name }
+            }
+        methods.forEach { method ->
             runCatching {
                 method.isAccessible = true
                 when {
+                    method.name == "buildLoadAdConfig" && method.parameterCount == 0 &&
+                        !Modifier.isStatic(method.modifiers) -> {
+                        module.hook(method).intercept(RewardLoadConfigHooker)
+                        hooked++
+                    }
                     isAudienceNetworkRewardShowMethod(clazz, method) -> {
                         module.hook(method).intercept(RewardShowHooker(method))
                         hooked++
@@ -1070,7 +1078,13 @@ object GameAdsHook {
         }
     }
 
-    private fun isAudienceNetworkRewardRelevantClass(className: String): Boolean {
+    private fun isAudienceNetworkRewardRelevantClass(clazz: Class<*>): Boolean {
+        return isAudienceNetworkRewardRelevantName(clazz.name) || clazz.interfaces.any { type ->
+            type.name.startsWith("com.facebook.ads.") && type.name.contains("Reward")
+        }
+    }
+
+    private fun isAudienceNetworkRewardRelevantName(className: String): Boolean {
         val normalized = className.lowercase()
         return (normalized.startsWith("com.facebook.ads.") ||
             normalized.startsWith("com.facebook.audiencenetwork.") ||
@@ -1084,8 +1098,7 @@ object GameAdsHook {
     }
 
     private fun isAudienceNetworkRewardShowMethod(clazz: Class<*>, method: Method): Boolean {
-        val className = clazz.name.lowercase()
-        return className.contains("reward") &&
+        return isAudienceNetworkRewardRelevantClass(clazz) &&
             method.name == "show" &&
             !Modifier.isStatic(method.modifiers) &&
             method.parameterCount <= 1 &&
@@ -1095,7 +1108,7 @@ object GameAdsHook {
     }
 
     private fun isAudienceNetworkRewardLoadMethod(clazz: Class<*>, method: Method): Boolean {
-        return clazz.name.lowercase().contains("reward") &&
+        return isAudienceNetworkRewardRelevantClass(clazz) &&
             method.name.lowercase().contains("load") &&
             !Modifier.isStatic(method.modifiers) &&
             method.parameterCount >= 1
@@ -1135,38 +1148,8 @@ object GameAdsHook {
         }
     }
 
-    private fun isAudienceNetworkRewardListenerObject(value: Any?): Boolean {
-        if (value == null) return false
-        val type = value.javaClass
-        val className = type.name.lowercase()
-        if (className.contains("listener") && (className.contains("reward") || className.contains("ad"))) {
-            return true
-        }
-        if (audienceNetworkInterfacesFor(type).any { iface ->
-                val ifaceName = iface.name.lowercase()
-                ifaceName.contains("listener") && (ifaceName.contains("reward") || ifaceName.contains("ad"))
-            }) {
-            return true
-        }
-        return audienceNetworkMethodsFor(type).any { method ->
-            method.name in AUDIENCE_NETWORK_REWARD_COMPLETION_METHOD_NAMES ||
-                method.name.contains("Reward", ignoreCase = true) ||
-                method.name.contains("InterstitialDismissed", ignoreCase = true)
-        }
-    }
-
-    private fun audienceNetworkInterfacesFor(type: Class<*>): List<Class<*>> {
-        val interfaces = LinkedHashSet<Class<*>>()
-        fun collect(current: Class<*>?) {
-            if (current == null || current == Any::class.java) return
-            current.interfaces.forEach { iface ->
-                if (interfaces.add(iface)) collect(iface)
-            }
-            collect(current.superclass)
-        }
-        collect(type)
-        return interfaces.toList()
-    }
+    private fun isAudienceNetworkRewardListenerObject(value: Any?): Boolean =
+        value != null && GameRewardCallbacks.isListener(value.javaClass)
 
     /**
      * Fires every reward listener reachable from the ad object (remembered
@@ -1198,101 +1181,25 @@ object GameAdsHook {
         return false
     }
 
-    private fun findAudienceNetworkRewardListeners(root: Any?): List<Any> {
-        if (root == null) return emptyList()
-
-        val listeners = LinkedHashSet<Any>()
-        val seen = IdentityHashMap<Any, Boolean>()
-        val queue = ArrayDeque<Pair<Any, Int>>()
-        queue.add(root to 0)
-
-        var inspected = 0
-        while (!queue.isEmpty() && inspected < 96 && listeners.size < 8) {
-            val (value, depth) = queue.removeFirst()
-            if (seen.put(value, true) != null) continue
-            inspected++
-
-            if (value !== root && isAudienceNetworkRewardListenerObject(value)) {
-                listeners.add(value)
-                continue
-            }
-            if (depth >= 5 || !shouldQueueAudienceNetworkObject(value)) continue
-
-            audienceNetworkFieldsFor(value.javaClass).forEach { field ->
-                val fieldValue = runCatching { field.get(value) }.getOrNull() ?: return@forEach
-                when (fieldValue) {
-                    is Iterable<*> -> fieldValue.take(12).forEach { item ->
-                        if (item != null &&
-                            (isAudienceNetworkRewardListenerObject(item) || shouldQueueAudienceNetworkObject(item))
-                        ) {
-                            queue.add(item to depth + 1)
-                        }
-                    }
-                    is Array<*> -> fieldValue.take(12).forEach { item ->
-                        if (item != null &&
-                            (isAudienceNetworkRewardListenerObject(item) || shouldQueueAudienceNetworkObject(item))
-                        ) {
-                            queue.add(item to depth + 1)
-                        }
-                    }
-                    else -> if (isAudienceNetworkRewardListenerObject(fieldValue) ||
-                        shouldQueueAudienceNetworkObject(fieldValue)
-                    ) {
-                        queue.add(fieldValue to depth + 1)
-                    }
-                }
-            }
-        }
-
-        return listeners.toList()
-    }
+    private fun findAudienceNetworkRewardListeners(root: Any?): List<Any> =
+        GameRewardCallbacks.findListeners(root, ::shouldQueueAudienceNetworkObject)
 
     /**
      * The listener callback ladder: load/impression/display, then the reward
      * completion, then the close — the order a real rewarded ad would fire.
      */
-    private fun invokeAudienceNetworkRewardListenerCallbacks(listener: Any, adObject: Any, source: String): Int {
-        var invoked = 0
-        val methodGroups = listOf(
-            setOf("onAdLoaded", "onLoggingImpression", "onInterstitialDisplayed"),
-            setOf(
-                "onRewardedVideoCompleted",
-                "onRewardedAdCompleted",
-                "onRewardedInterstitialCompleted",
-                "onAdComplete",
-                "onAdCompleted"
-            ),
-            setOf("onRewardedVideoClosed", "onRewardedInterstitialClosed", "onAdClosed", "onInterstitialDismissed")
-        )
-
-        methodGroups.forEach { group ->
-            audienceNetworkMethodsFor(listener.javaClass)
-                .filter { method -> method.name in group }
-                .forEach { method ->
-                    val args = audienceNetworkCallbackArgs(method, adObject) ?: return@forEach
-                    runCatching {
-                        method.invoke(listener, *args)
-                        invoked++
-                        L.i(TAG, "invoked Audience Network callback ${listener.javaClass.name}.${method.name} via $source")
-                    }.onFailure {
-                        L.w(TAG, "Audience Network callback failed ${listener.javaClass.name}.${method.name}", it)
-                    }
-                }
-        }
-
-        return invoked
-    }
-
-    private fun audienceNetworkCallbackArgs(method: Method, adObject: Any): Array<Any?>? {
-        return when (method.parameterCount) {
-            0 -> emptyArray()
-            1 -> {
-                val paramType = method.parameterTypes[0]
-                if (paramType.isAssignableFrom(adObject.javaClass)) arrayOf(adObject) else null
-            }
-            else -> null
-        }
-    }
+    private fun invokeAudienceNetworkRewardListenerCallbacks(listener: Any, adObject: Any, source: String): Int =
+        GameRewardCallbacks.deliver(
+            listener,
+            adObject,
+            audienceNetworkMethodsFor(listener.javaClass),
+            onInvoked = { method ->
+                L.i(TAG, "invoked Audience Network callback ${listener.javaClass.name}.${method.name} via $source")
+            },
+            onFailure = { method, failure ->
+                L.w(TAG, "Audience Network callback failed ${listener.javaClass.name}.${method.name}", failure)
+            },
+        ).completed
 
     private fun audienceNetworkFieldsFor(type: Class<*>): List<Field> {
         val fields = ArrayList<Field>()
@@ -1350,7 +1257,8 @@ object GameAdsHook {
     private fun shouldTraverseAudienceNetworkObject(value: Any, isRootActivity: Boolean): Boolean {
         if (isRootActivity) return true
         val className = value.javaClass.name.lowercase()
-        return className.startsWith("com.facebook.ads.") ||
+        return className.startsWith("x.") ||
+            className.startsWith("com.facebook.ads.") ||
             className.startsWith("com.facebook.audiencenetwork.") ||
             className.contains("audiencenetwork") ||
             className.contains("reward") ||
@@ -1364,14 +1272,25 @@ object GameAdsHook {
     // Activity handling
     // ------------------------------------------------------------------
 
-    /** Closes a game-ad activity; AN activities get reward completion first. */
+    /** Closes plain game ads; rewarded or unclassified AN ads require completion first. */
     private fun handleGameAdActivity(activity: Activity, source: String) {
         if (!enabled()) return
         when (activity.javaClass.name) {
             AUDIENCE_NETWORK_ACTIVITY_CLASS,
             AUDIENCE_NETWORK_REMOTE_ACTIVITY_CLASS -> {
-                forceAudienceNetworkRewardCompletion(activity, source)
-                finishGameAdActivity(activity, source)
+                // Audience Network uses the same activities for plain and rewarded ads.
+                // Use the actual SDK view type; recent requests may belong to another ad.
+                val viewType = runCatching {
+                    activity.intent?.getSerializableExtra(GameAdLifecyclePolicy.VIEW_TYPE_EXTRA)
+                }.getOrNull()
+                val kind = GameAdLifecyclePolicy.classifyActivity(viewType, activity)
+                if (GameAdLifecyclePolicy.shouldClose(kind) {
+                        forceAudienceNetworkRewardCompletion(activity, source)
+                    }) {
+                    finishGameAdActivity(activity, source)
+                } else {
+                    L.w(TAG, "reward completion unresolved for $kind — leaving Audience Network activity running via $source")
+                }
             }
             else -> finishGameAdActivity(activity, source)
         }
@@ -1396,8 +1315,8 @@ object GameAdsHook {
      * reward-completion callback found — the AN activity holds the ad
      * controller whose listeners the game installed.
      */
-    private fun forceAudienceNetworkRewardCompletion(activity: Activity, source: String) {
-        if (activity.javaClass.name !in GAME_AD_ACTIVITY_CLASS_NAMES) return
+    private fun forceAudienceNetworkRewardCompletion(activity: Activity, source: String): Boolean {
+        if (activity.javaClass.name !in GAME_AD_ACTIVITY_CLASS_NAMES) return false
 
         val seen = IdentityHashMap<Any, Boolean>()
         val queue = ArrayDeque<Pair<Any, Int>>()
@@ -1430,6 +1349,7 @@ object GameAdsHook {
         }
 
         L.i(TAG, "forced Audience Network reward callbacks invoked=$invoked inspected=$inspected via $source")
+        return invoked > 0
     }
 
     private fun invokeAudienceNetworkRewardCompletionMethods(target: Any): Int {
@@ -1630,7 +1550,9 @@ object GameAdsHook {
             return false
         }
 
-        val resolveMethod = resolveGameAdResolveMethod(target.javaClass)
+        val endpoint = GamePromiseResolver.find(target, JSONObject::class.java)
+        val resolveOwner = endpoint?.owner ?: target
+        val resolveMethod = endpoint?.resolve ?: resolveGameAdResolveMethod(target.javaClass)
         if (resolveMethod == null) {
             L.w(TAG, "unable to resolve success helper for resolved game ad payload")
             return false
@@ -1638,7 +1560,7 @@ object GameAdsHook {
 
         val successPayload = buildGameAdSuccessPayload(payload, messageType)
         return runCatching {
-            resolveMethod.invoke(target, promiseId, successPayload)
+            resolveMethod.invoke(resolveOwner, promiseId, successPayload)
             true
         }.getOrElse {
             L.w(TAG, "failed to resolve game ad payload", it)
@@ -1657,6 +1579,17 @@ object GameAdsHook {
         code: String = GAME_AD_REJECTION_CODE
     ): Boolean {
         if (target == null || payload == null) return false
+
+        GamePromiseResolver.find(target, JSONObject::class.java)?.let { endpoint ->
+            val promiseId = extractPromiseId(payload) ?: return false
+            return runCatching {
+                endpoint.reject.invoke(endpoint.owner, promiseId, message, code)
+                true
+            }.getOrElse {
+                L.w(TAG, "failed to reject game ad payload through delegate", it)
+                false
+            }
+        }
 
         val bridgeRejectMethod = resolveGameAdBridgeRejectMethod(target.javaClass)
         if (bridgeRejectMethod != null) {
@@ -1750,11 +1683,12 @@ object GameAdsHook {
      */
     private fun dispatchGameEvent(target: Any?, eventType: String, content: Any?): Boolean {
         if (target == null) return false
-        val dispatchMethod = resolveGameEventDispatchMethod(target.javaClass) ?: return false
+        val owner = GamePromiseResolver.find(target, JSONObject::class.java)?.owner ?: target
+        val dispatchMethod = resolveGameEventDispatchMethod(owner.javaClass) ?: return false
         val eventValue = resolveGameEventValue(dispatchMethod.parameterTypes[0], eventType) ?: return false
 
         return runCatching {
-            dispatchMethod.invoke(target, eventValue, content ?: JSONObject.NULL)
+            dispatchMethod.invoke(owner, eventValue, content ?: JSONObject.NULL)
             true
         }.getOrElse {
             L.w(TAG, "failed to dispatch game event type=$eventType", it)
@@ -2386,12 +2320,27 @@ object GameAdsHook {
         }
     }
 
+    /** Captures the concrete obfuscated SDK builder at its public factory. */
+    private object RewardLoadConfigHooker : Hooker {
+        override fun intercept(chain: XposedInterface.Chain): Any? {
+            val result = chain.proceed()
+            if (result != null) {
+                runCatching {
+                    moduleHooker?.let { module ->
+                        tryHookAudienceNetworkRewardClass(module, result.javaClass)
+                    }
+                }.onFailure { L.w(TAG, "rewarded load-config builder hook failed", it) }
+            }
+            return result
+        }
+    }
+
     /** ClassLoader.loadClass — hooks relevant lazily loaded SDK classes. */
     private object LoadClassWatcher : Hooker {
         override fun intercept(chain: XposedInterface.Chain): Any? {
             val result = chain.proceed()
             val clazz = result as? Class<*> ?: return result
-            if (isAudienceNetworkRewardRelevantClass(clazz.name)) {
+            if (isAudienceNetworkRewardRelevantName(clazz.name)) {
                 runCatching { moduleHooker?.let { tryHookAudienceNetworkRewardClass(it, clazz) } }
                     .onFailure { L.w(TAG, "dynamic Audience Network class hook failed: ${clazz.name}", it) }
             }

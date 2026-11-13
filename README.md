@@ -2,7 +2,9 @@
 
 An LSPosed/Xposed module for `com.facebook.katana` that removes ads using structural DexKit discovery plus guarded, version-specific fast paths.
 
-Original port target: Facebook `576.0.0.42.73`; development/device testing also covers `580.0.0.51.74`. Module `1.24` (versionCode 25). Discovery is primarily structural rather than based on hardcoded obfuscated class names, but an individual hook can still need revision after a Facebook update. Older versions (571 and below) are no longer supported.
+Original port target: Facebook `576.0.0.42.73`; development/device testing also covers `580.0.0.51.74` and `587.0.0.39.55`. Module `1.25` (versionCode 26). Discovery is primarily structural rather than based on hardcoded obfuscated class names, but an individual hook can still need revision after a Facebook update. Older versions (571 and below) are no longer supported.
+
+Version 1.25 restores contextual story/reel actions and rewarded-game completion on Facebook 587, and prevents repeated AMOLED hook registration. The older supported hook layouts remain available; this update does not require users to update Facebook. Existing settings are retained, while discovery caches refresh for the new module version.
 
 ## Features
 

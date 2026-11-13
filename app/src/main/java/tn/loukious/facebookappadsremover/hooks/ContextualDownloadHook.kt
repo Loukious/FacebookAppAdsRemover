@@ -4,6 +4,7 @@ import android.content.Context
 import io.github.libxposed.api.XposedInterface
 import io.github.libxposed.api.XposedInterface.Hooker
 import org.luckypray.dexkit.DexKitBridge
+import org.luckypray.dexkit.result.FieldData
 import org.luckypray.dexkit.result.MethodData
 import tn.loukious.facebookappadsremover.core.L
 import tn.loukious.facebookappadsremover.core.Settings
@@ -167,19 +168,79 @@ object ContextualDownloadHook {
         bridge: DexKitBridge,
         classLoader: ClassLoader,
     ): List<Method>? = runCatching {
-        // Morphe fingerprints the analytics-bearing method only to learn the
-        // action class. The actual tap handler is then selected from that class.
+        val methods = ContextualDiscoverySelection.withFallback(
+            primary = { findNativeStoryMethods(bridge, classLoader) },
+            fallback = { findLegacyStoryMethods(bridge, classLoader) },
+        )
+        check(hookStoryMethods(module, methods)) { "No story methods were hooked" }
+        L.i(TAG, "native story Save hook installed: ${methods[2].declaringClass.name}")
+        L.i(TAG, "native story Repost menu injection ready")
+        methods
+    }.onFailure { L.w(TAG, "story contextual discovery failed", it) }.getOrNull()
+
+    private fun findNativeStoryMethods(
+        bridge: DexKitBridge,
+        classLoader: ClassLoader,
+    ): List<Method> {
+        // 587 moved save_story_attempted behind a string-table lookup. Derive
+        // the Save action from the native download-icon menu row instead of
+        // treating unrelated saving analytics as the tap handler's class.
+        val icon = findDownloadIcon(bridge)
+        val listBuilder = "com.google.common.collect.ImmutableList\$Builder"
+        val builders = bridge.findMethod {
+            matcher { declaredClass(STORY_MORE_MENU) }
+        }.filter { method ->
+            listBuilder in method.paramTypeNames && method.usingFields.any {
+                it.field.declaredClassName == icon.declaredClassName &&
+                    it.field.fieldName == icon.fieldName
+            } && method.invokes.any {
+                it.isConstructor && StoryMenuSignature.accepts(it.paramTypeNames, icon.typeName)
+            }
+        }
+        check(builders.size == 1) {
+            "Expected 1 native story Save menu builder, found ${builders.size}"
+        }
+        val builderData = builders.single()
+        val menuItemCtor = builderData.invokes.filter {
+            it.isConstructor && StoryMenuSignature.accepts(it.paramTypeNames, icon.typeName)
+        }.distinctBy(MethodData::descriptor).single()
+        val actionCtors = builderData.invokes.filter { called ->
+            called.isConstructor && Context::class.java.name in called.paramTypeNames &&
+                STORY_CARD in called.paramTypeNames && called.declaredClass?.methods?.any {
+                    it.returnTypeName == "void" &&
+                        it.paramTypeNames == listOf(menuItemCtor.declaredClassName)
+                } == true
+        }.distinctBy { it.declaredClassName }
+        check(actionCtors.size == 1) {
+            "Expected 1 native story Save action, found ${actionCtors.size}"
+        }
+        val actionClass = actionCtors.single().declaredClass
+            ?: error("Save-story action class could not be resolved")
+        val actionClassName = actionClass.name
+
+        val handlers = actionClass.methods.filter {
+            it.methodName != "<init>" && it.returnTypeName == "void" &&
+                it.paramTypeNames == listOf(menuItemCtor.declaredClassName)
+        }
+        return resolveStoryMethods(builderData, handlers, actionClassName, classLoader)
+    }
+
+    private fun findLegacyStoryMethods(
+        bridge: DexKitBridge,
+        classLoader: ClassLoader,
+    ): List<Method> {
+        // Older supported builds expose the Save action through this analytics
+        // anchor. Keep their original discovery path if the native row cannot
+        // be selected or validated; do not install anything until it validates.
         val actionHits = bridge.findMethod {
             matcher { usingStrings(SAVE_STORY_ATTEMPTED) }
         }.filter { it.returnTypeName == "void" && it.paramCount == 1 }
-
         check(actionHits.size == 1) {
             "Expected 1 save-story action fingerprint, found ${actionHits.size}"
         }
         val actionClass = actionHits.single().declaredClass
             ?: error("Save-story action class could not be resolved")
         val actionClassName = actionClass.name
-
         val builders = bridge.findMethod {
             matcher { declaredClass(STORY_MORE_MENU) }
         }.filter { method ->
@@ -188,8 +249,18 @@ object ContextualDownloadHook {
         check(builders.size == 1) {
             "Expected 1 story menu builder creating $actionClassName, found ${builders.size}"
         }
-        val builderData = builders.single()
+        val handlers = actionClass.methods.filter {
+            it.methodName != "<init>" && it.returnTypeName == "void" && it.paramCount == 1
+        }
+        return resolveStoryMethods(builders.single(), handlers, actionClassName, classLoader)
+    }
 
+    private fun resolveStoryMethods(
+        builderData: MethodData,
+        handlers: List<MethodData>,
+        actionClassName: String,
+        classLoader: ClassLoader,
+    ): List<Method> {
         // Same shape Morphe patches: a non-framework virtual ()Z call.
         val capabilities = builderData.invokes.filter { called ->
             called.paramCount == 0 &&
@@ -202,9 +273,6 @@ object ContextualDownloadHook {
             "Expected 1 story save capability, found ${capabilities.size}"
         }
 
-        val handlers = actionClass.methods.filter {
-            it.methodName != "<init>" && it.returnTypeName == "void" && it.paramCount == 1
-        }
         check(handlers.size == 1) {
             "Expected 1 story tap handler on $actionClassName, found ${handlers.size}"
         }
@@ -214,11 +282,27 @@ object ContextualDownloadHook {
             capabilities.single().getMethodInstance(classLoader),
             handlers.single().getMethodInstance(classLoader),
         )
-        check(hookStoryMethods(module, methods)) { "No story methods were hooked" }
-        L.i(TAG, "native story Save hook installed: $actionClassName")
-        L.i(TAG, "native story Repost menu injection ready")
-        methods
-    }.onFailure { L.w(TAG, "story contextual discovery failed", it) }.getOrNull()
+        // Validate without logging or installing hooks so a rejected native
+        // candidate can fall back cleanly to the older analytics path.
+        resolveStoryRuntime(methods[0], methods[2])
+        return methods
+    }
+
+    private fun findDownloadIcon(bridge: DexKitBridge, enumType: String? = null): FieldData {
+        val fields = bridge.findMethod {
+            matcher { usingStrings(DOWNLOAD_ROW) }
+        }.flatMap { it.usingFields }.map { it.field }.filter { field ->
+            Modifier.isStatic(field.modifiers) && if (enumType == null) {
+                field.declaredClassName == field.typeName
+            } else {
+                // Reels already establish the enum type from the native icon
+                // wrapper. Older builds may expose it through a holder class.
+                field.typeName == enumType
+            }
+        }.distinctBy { it.descriptor }
+        check(fields.size == 1) { "Expected 1 native download icon, found ${fields.size}" }
+        return fields.single()
+    }
 
     private fun hookStoryMethods(module: XposedInterface, methods: List<Method>): Boolean {
         if (methods.size != 3) return false
@@ -415,12 +499,31 @@ object ContextualDownloadHook {
             matcher { usingStrings(REEL_SIDEBAR) }
         }
         L.i(TAG, "reel discovery: ${anchorHits.size} UDDSideBarComponent string hits")
-        val sidebarCandidates = anchorHits.filter { method ->
-            method.invokes.any { called ->
-                called.paramTypeNames.count { it == FUNCTION1 } == 4 &&
-                    called.paramTypeNames.firstOrNull() == FB_USER_SESSION
-            }
+        fun assemblyCall(method: MethodData): Boolean =
+            method.paramTypeNames.count { it == "java.util.ArrayList" } == 2 &&
+                "java.util.List" in method.paramTypeNames
+        fun factoryCall(called: MethodData): Boolean =
+            called.paramTypeNames.count { it == FUNCTION1 } == 4 &&
+                called.paramTypeNames.firstOrNull() == FB_USER_SESSION &&
+                ReelFactorySignature.accepts(called.paramTypeNames)
+        fun helperCalls(method: MethodData): List<MethodData> =
+            method.invokes.filter {
+                // 587 builds buttons in a same-class helper called by render.
+                // Follow exactly one such hop, rather than widening to an
+                // unrelated factory found elsewhere in the host's dexes.
+                !it.isConstructor && it.declaredClassName == method.declaredClassName
+            }.distinctBy(MethodData::descriptor).flatMap { it.invokes }
+
+        val renderCandidates = anchorHits.filter { method ->
+            method.paramCount == 1 && !Modifier.isStatic(method.modifiers) &&
+                method.invokes.any(::assemblyCall)
         }
+        val selectedCalls = ContextualDiscoverySelection.preferDirect(
+            renderCandidates,
+            directMatch = { it.invokes.any(::factoryCall) },
+            helperMatch = { helperCalls(it).any(::factoryCall) },
+        )
+        val sidebarCandidates = selectedCalls.candidates
         L.i(TAG, "reel discovery: ${sidebarCandidates.size} matching sidebar builders")
         check(sidebarCandidates.size == 1) {
             "Expected 1 reel sidebar builder, found ${sidebarCandidates.size}"
@@ -428,23 +531,26 @@ object ContextualDownloadHook {
         val sidebar = sidebarCandidates.single()
         check(sidebar.paramCount == 1) { "Reel sidebar builder now takes ${sidebar.paramCount} params" }
 
-        val factories = sidebar.invokes.filter { called ->
+        val nativeButtonCalls = sidebar.invokes +
+            if (selectedCalls.includeHelpers) helperCalls(sidebar) else emptyList()
+        val factories = nativeButtonCalls.filter { called ->
             called.paramTypeNames.count { it == FUNCTION1 } == 4 &&
                 called.paramTypeNames.firstOrNull() == FB_USER_SESSION
         }.distinctBy(MethodData::descriptor)
         check(factories.size == 1) { "Expected 1 reel button factory, found ${factories.size}" }
         val factory = factories.single()
-        // 578 has 19 arguments, 580 has 20. Validate the semantic prefix and
-        // allow *any number* of subsequent boolean feature flags: copy the
-        // current reel's values rather than guessing defaults for new flags.
+        // 587 inserts an additional primary wrapper before the labels. The
+        // layout maps verified slots, clears its optional secondary text,
+        // and preserves trailing feature flags from the current template.
         check(ReelFactorySignature.accepts(factory.paramTypeNames)) {
             "Reel button factory has incompatible signature: ${factory.descriptor}"
         }
 
         val parameters = factory.paramTypeNames
-        val iconBaseType = parameters[5]
+        val layout = ReelFactorySignature.layout(parameters)!!
+        val iconBaseType = parameters[layout.argumentIndex(5)]
 
-        val wrapperCtors = sidebar.invokes.filter { called ->
+        val wrapperCtors = nativeButtonCalls.filter { called ->
             called.isConstructor &&
                 called.paramCount == 1 &&
                 called.declaredClass?.superClass?.name == iconBaseType
@@ -453,10 +559,7 @@ object ContextualDownloadHook {
         val iconWrapperCtor = wrapperCtors.single()
         val iconEnumType = iconWrapperCtor.paramTypeNames.single()
 
-        val assemblies = sidebar.invokes.filter { called ->
-            called.paramTypeNames.count { it == "java.util.ArrayList" } == 2 &&
-                called.paramTypeNames.any { it == "java.util.List" }
-        }.distinctBy(MethodData::descriptor)
+        val assemblies = sidebar.invokes.filter(::assemblyCall).distinctBy(MethodData::descriptor)
         check(assemblies.size == 1) { "Expected 1 reel sidebar assembly call, found ${assemblies.size}" }
         val assembly = assemblies.single()
 
@@ -468,15 +571,7 @@ object ContextualDownloadHook {
         check(markers.size == 1) { "Expected 1 reel icon marker, found ${markers.size}" }
         val marker = markers.single()
 
-        val icon = bridge.findMethod {
-            matcher { usingStrings(DOWNLOAD_ROW) }
-        }.asSequence()
-            .flatMap { it.usingFields.asSequence() }
-            .map { it.field }
-            .firstOrNull { field ->
-                field.typeName == iconEnumType && Modifier.isStatic(field.modifiers)
-            }
-        check(icon != null) { "Facebook download row exposes no icon of $iconEnumType" }
+        val icon = findDownloadIcon(bridge, iconEnumType)
 
         val component = sidebar.declaredClass
             ?: error("Reel sidebar class could not be resolved")
@@ -660,9 +755,8 @@ object ContextualDownloadHook {
         icon: Any,
     ): Any? {
         val p = runtime.factory.parameterTypes
-        if (template.size != p.size ||
-            !ReelFactorySignature.accepts(p.map { it.name })
-        ) {
+        val layout = ReelFactorySignature.layout(p.map { it.name })
+        if (template.size != p.size || layout == null) {
             L.w(TAG, "reel button factory layout no longer matches the captured template")
             return null
         }
@@ -672,7 +766,7 @@ object ContextualDownloadHook {
         }
 
         val primaryCtor = p[2].getDeclaredConstructor(String::class.java, functionType).apply { isAccessible = true }
-        val labelCtor = p[3].getDeclaredConstructor(String::class.java, functionType).apply { isAccessible = true }
+        val labelCtor = p[layout.argumentIndex(3)].getDeclaredConstructor(String::class.java, functionType).apply { isAccessible = true }
         val iconCtor = runtime.iconWrapper.getDeclaredConstructor(runtime.iconField.type).apply {
             isAccessible = true
         }
@@ -683,26 +777,26 @@ object ContextualDownloadHook {
         // Keep Facebook's real session/mode and any opaque state from a button
         // it just built for this exact reel, replacing only the values Morphe
         // explicitly supplies for its Download button.
-        val args = template.copyOf()
+        val args = layout.copyTemplate(template)
         args[2] = primaryCtor.newInstance(label, handlers[0])
-        args[3] = labelCtor.newInstance(label, handlers[1])
-        args[4] = labelCtor.newInstance(label, handlers[2])
-        args[5] = iconCtor.newInstance(icon)
-        args[6] = true
-        args[7] = false
-        args[8] = testId
-        args[9] = CAPTION
+        args[layout.argumentIndex(3)] = labelCtor.newInstance(label, handlers[1])
+        args[layout.argumentIndex(4)] = labelCtor.newInstance(label, handlers[2])
+        args[layout.argumentIndex(5)] = iconCtor.newInstance(icon)
+        args[layout.argumentIndex(6)] = true
+        args[layout.argumentIndex(7)] = false
+        args[layout.argumentIndex(8)] = testId
+        args[layout.argumentIndex(9)] = CAPTION
         // Factory parameter 10 is String. Morphe's `const/16 v50, 0x0`
         // passes a null object reference here, not integer zero.
-        args[10] = null
-        args[11] = handlers[3]
-        args[12] = handlers[4]
-        args[13] = handlers[5]
-        args[14] = handlers[6]
-        args[15] = 0x11
-        args[16] = false
-        args[17] = true
-        args[18] = false
+        args[layout.argumentIndex(10)] = null
+        args[layout.argumentIndex(11)] = handlers[3]
+        args[layout.argumentIndex(12)] = handlers[4]
+        args[layout.argumentIndex(13)] = handlers[5]
+        args[layout.argumentIndex(14)] = handlers[6]
+        args[layout.argumentIndex(15)] = 0x11
+        args[layout.argumentIndex(16)] = false
+        args[layout.argumentIndex(17)] = true
+        args[layout.argumentIndex(18)] = false
         // Any additional flags are deliberately left as Facebook supplied
         // them in the original button for this reel.
         return runtime.factory.invoke(null, *args)
