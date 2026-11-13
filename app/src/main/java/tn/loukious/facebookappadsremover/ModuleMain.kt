@@ -220,7 +220,9 @@ class ModuleMain : XposedModule() {
         // dexElements some time after onCreate (dextricks async init). Retry
         // the probe until all stable classes resolve, then run discovery.
         val main = android.os.Handler(android.os.Looper.getMainLooper())
-        val delays = longArrayOf(1000, 3000, 7000, 15000, 30000)
+        // Keep probing for slow cold starts (e.g. the first launch after a
+        // Facebook update re-extracts the secondary dex); discovery runs once.
+        val delays = longArrayOf(1000, 3000, 7000, 15000, 30000, 60000, 120000, 240000)
         for (d in delays) {
             main.postDelayed({ probeAndMaybeDiscover(context) }, d)
         }

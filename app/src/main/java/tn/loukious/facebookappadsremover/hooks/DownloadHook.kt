@@ -194,6 +194,8 @@ object DownloadHook {
      *  module itself, so remote preferences — read-only — can't hold it). */
     private const val PREFS_NAME = "fbar_download"
     private const val KEY_HISTORY = "history"
+    private const val HISTORY_MAX = 200
+    private const val ALL_DATA_MAX_BYTES = 2L * 1024 * 1024
 
     private lateinit var appContext: Context
     private val main = Handler(Looper.getMainLooper())
@@ -206,6 +208,9 @@ object DownloadHook {
     private val io: ExecutorService = Executors.newSingleThreadExecutor()
     private val thumbIo: ExecutorService = Executors.newSingleThreadExecutor()
     private val dlIo: ExecutorService = Executors.newSingleThreadExecutor()
+
+    /** One connection pool/dispatcher for every request; call sites derive per-use timeouts via newBuilder(). */
+    private val baseHttp: okhttp3.OkHttpClient by lazy { okhttp3.OkHttpClient() }
 
     /**
      * Decoded card thumbnails, keyed by album-art URL or "frame:<videoId>".
@@ -1560,7 +1565,7 @@ object DownloadHook {
      */
     fun fetchQualities(pageUrl: String): FetchedQualities? {
         if (!pageUrl.startsWith("http://") && !pageUrl.startsWith("https://")) return null
-        val client = okhttp3.OkHttpClient.Builder()
+        val client = baseHttp.newBuilder()
             .connectTimeout(15, java.util.concurrent.TimeUnit.SECONDS)
             .readTimeout(20, java.util.concurrent.TimeUnit.SECONDS)
             .build()
@@ -1644,7 +1649,10 @@ object DownloadHook {
         runCatching {
             val dir = File(appContext.dataDir, DIR_NAME)
             dir.mkdirs()
-            File(dir, "AllData.txt").appendText(params + "\n\n")
+            val allData = File(dir, "AllData.txt")
+            // Debug dump only: keep it bounded instead of growing forever.
+            if (allData.length() > ALL_DATA_MAX_BYTES) allData.delete()
+            allData.appendText(params + "\n\n")
 
             val playlist = if (data.playlist != null) {
                 JSONObject().apply {
@@ -1917,7 +1925,7 @@ object DownloadHook {
 
         /** First ~4MB of a video URL — enough for the poster frame. */
         private fun downloadHead(url: String, out: File) {
-            val client = okhttp3.OkHttpClient.Builder()
+            val client = baseHttp.newBuilder()
                 .connectTimeout(10, java.util.concurrent.TimeUnit.SECONDS)
                 .readTimeout(15, java.util.concurrent.TimeUnit.SECONDS)
                 .build()
@@ -2293,14 +2301,25 @@ object DownloadHook {
                         put(android.provider.MediaStore.Video.Media.MIME_TYPE, "video/$ext")
                         put(android.provider.MediaStore.Video.Media.RELATIVE_PATH,
                             Environment.DIRECTORY_MOVIES + "/FB_Download")
+                        // Hidden from the gallery until the bytes are complete.
+                        put(android.provider.MediaStore.Video.Media.IS_PENDING, 1)
                     }
                     val resolver = appContext.contentResolver
                     val uri = resolver.insert(
                         android.provider.MediaStore.Video.Media.EXTERNAL_CONTENT_URI, values)
                         ?: error("MediaStore insert failed")
-                    resolver.openOutputStream(uri)?.use { os ->
-                        stream(url, os)
-                    } ?: error("openOutputStream failed")
+                    try {
+                        resolver.openOutputStream(uri)?.use { os ->
+                            stream(url, os)
+                        } ?: error("openOutputStream failed")
+                        resolver.update(uri, android.content.ContentValues().apply {
+                            put(android.provider.MediaStore.Video.Media.IS_PENDING, 0)
+                        }, null, null)
+                    } catch (t: Throwable) {
+                        // Don't leave a 0-byte/truncated video behind.
+                        runCatching { resolver.delete(uri, null, null) }
+                        throw t
+                    }
                     out = File(name)
                 } else {
                     @Suppress("DEPRECATION")
@@ -2321,7 +2340,7 @@ object DownloadHook {
     }
 
     private fun stream(url: String, os: java.io.OutputStream) {
-        val client = okhttp3.OkHttpClient.Builder()
+        val client = baseHttp.newBuilder()
             .connectTimeout(30, java.util.concurrent.TimeUnit.SECONDS)
             .readTimeout(120, java.util.concurrent.TimeUnit.SECONDS)
             .build()
@@ -2340,7 +2359,11 @@ object DownloadHook {
             val arr = org.json.JSONArray(prefs.getString(KEY_HISTORY, "[]"))
             arr.put(JSONObject().put("url", url).put("ext", ext)
                 .put("at", System.currentTimeMillis()))
-            prefs.edit().putString(KEY_HISTORY, arr.toString()).apply()
+            // Keep only the newest entries; the whole array is rewritten each time.
+            val trimmed = if (arr.length() <= HISTORY_MAX) arr else org.json.JSONArray().apply {
+                for (i in arr.length() - HISTORY_MAX until arr.length()) put(arr.get(i))
+            }
+            prefs.edit().putString(KEY_HISTORY, trimmed.toString()).apply()
         }
     }
 
@@ -2437,7 +2460,7 @@ object DownloadHook {
 
                 // MeiOkHttp.postJsonStream client: 60s connect / 10min read /
                 // 60s write.
-                val client = okhttp3.OkHttpClient.Builder()
+                val client = baseHttp.newBuilder()
                     .connectTimeout(60, java.util.concurrent.TimeUnit.SECONDS)
                     .readTimeout(600, java.util.concurrent.TimeUnit.SECONDS)
                     .writeTimeout(60, java.util.concurrent.TimeUnit.SECONDS)
@@ -2737,7 +2760,7 @@ object DownloadHook {
 
         /** OkHttp download to a cache file with byte progress. */
         private fun downloadStream(url: String, out: File, onProgress: (Long, Long) -> Unit) {
-            val client = okhttp3.OkHttpClient.Builder()
+            val client = baseHttp.newBuilder()
                 .connectTimeout(30, java.util.concurrent.TimeUnit.SECONDS)
                 .readTimeout(120, java.util.concurrent.TimeUnit.SECONDS)
                 .build()
