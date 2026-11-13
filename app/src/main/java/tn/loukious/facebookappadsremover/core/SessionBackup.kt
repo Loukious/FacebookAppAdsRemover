@@ -93,15 +93,26 @@ object SessionBackup {
     /** Session-file search bound: FB's data dir is deep, but not that deep. */
     private const val MAX_WALK_DEPTH = 6
 
+    /** Per-request token from the module app, echoed in [ACTION_RESULT]. */
+    const val EXTRA_NONCE = "nonce"
+    private val requestNonce = ThreadLocal<String?>()
+
     private val receiver = object : BroadcastReceiver() {
         override fun onReceive(ctx: Context, intent: Intent) {
             val app = ctx.applicationContext
+            // Echoed back with the result so the module app only shows replies
+            // to requests it actually sent.
+            val nonce = intent.getStringExtra(EXTRA_NONCE)
+            fun run(name: String, work: () -> Unit) = Thread {
+                requestNonce.set(nonce)
+                work()
+            }.apply { this.name = name }.start()
             when (intent.action) {
-                ACTION_EXPORT -> Thread { exportSession(app) }.apply { name = "fbar-session-export" }.start()
-                ACTION_IMPORT -> Thread { importLatest(app) }.apply { name = "fbar-session-import" }.start()
-                ACTION_IMPORT_DATA -> Thread {
+                ACTION_EXPORT -> run("fbar-session-export") { exportSession(app) }
+                ACTION_IMPORT -> run("fbar-session-import") { importLatest(app) }
+                ACTION_IMPORT_DATA -> run("fbar-session-import") {
                     importData(app, intent.getStringExtra(EXTRA_DATA))
-                }.apply { name = "fbar-session-import" }.start()
+                }
             }
         }
     }
@@ -154,9 +165,9 @@ object SessionBackup {
             .put("exported_at", System.currentTimeMillis())
             .put("user_id", account.getString(AccountHook.KEY_USER_ID, null) ?: JSONObject.NULL)
             .put("username", account.getString(AccountHook.KEY_USERNAME, null) ?: JSONObject.NULL)
-            .put("auth_token", account.getString(AccountHook.KEY_AUTH_TOKEN, null) ?: JSONObject.NULL)
-            .put("cookie_json", account.getString(AccountHook.KEY_COOKIE_JSON, null) ?: JSONObject.NULL)
-            .put("cookie_http", account.getString(AccountHook.KEY_COOKIE_HTTP, null) ?: JSONObject.NULL)
+            // The captured token/cookies are not written: import never reads
+            // them, and a file in shared Downloads should not carry more
+            // credentials than the session files themselves.
             // relative-path -> base64 content; import writes each back verbatim.
             .put("files", payload)
 
@@ -329,6 +340,7 @@ object SessionBackup {
                 .setPackage("tn.loukious.facebookappadsremover")
                 .putExtra(EXTRA_OK, ok)
                 .putExtra(EXTRA_MESSAGE, message)
+                .putExtra(EXTRA_NONCE, requestNonce.get())
             context.sendBroadcast(intent)
         }
     }

@@ -18,8 +18,32 @@ import tn.loukious.facebookappadsremover.core.SessionBackup
  */
 class SessionResultReceiver : BroadcastReceiver() {
 
+    companion object {
+        private const val PREFS = "fbar_session_request"
+        private const val KEY_NONCE = "nonce"
+
+        /**
+         * The receiver must stay exported (Facebook's process sends the
+         * result), so it only trusts replies carrying the token of the last
+         * request this app sent. Returns that new token.
+         */
+        fun newRequestNonce(context: Context): String {
+            val nonce = java.util.UUID.randomUUID().toString()
+            context.getSharedPreferences(PREFS, Context.MODE_PRIVATE).edit()
+                .putString(KEY_NONCE, nonce).apply()
+            return nonce
+        }
+    }
+
     override fun onReceive(context: Context, intent: Intent) {
         if (intent.action != SessionBackup.ACTION_RESULT) return
+        val expected = context.getSharedPreferences(PREFS, Context.MODE_PRIVATE)
+            .getString(KEY_NONCE, null)
+        val nonce = intent.getStringExtra(SessionBackup.EXTRA_NONCE)
+        if (expected == null || nonce != expected) {
+            android.util.Log.w("FBAR.Session", "ignoring session result without a matching request")
+            return
+        }
         val ok = intent.getBooleanExtra(SessionBackup.EXTRA_OK, false)
         val message = intent.getStringExtra(SessionBackup.EXTRA_MESSAGE) ?: return
         runCatching {

@@ -263,6 +263,7 @@ class MainActivity : AppCompatActivity() {
 
     private fun sendSession(action: String) {
         val intent = Intent(action).setPackage("com.facebook.katana")
+            .putExtra(SessionBackup.EXTRA_NONCE, SessionResultReceiver.newRequestNonce(this))
         val sent = runCatching { sendBroadcast(intent) }.isSuccess
         Toast.makeText(
             this,
@@ -289,6 +290,7 @@ class MainActivity : AppCompatActivity() {
         val intent = Intent(SessionBackup.ACTION_IMPORT_DATA)
             .setPackage("com.facebook.katana")
             .putExtra(SessionBackup.EXTRA_DATA, text)
+            .putExtra(SessionBackup.EXTRA_NONCE, SessionResultReceiver.newRequestNonce(this))
         runCatching { sendBroadcast(intent) }
             .onSuccess { Toast.makeText(this, "Asking Facebook…", Toast.LENGTH_SHORT).show() }
             .onFailure {
