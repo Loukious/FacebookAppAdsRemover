@@ -6,6 +6,7 @@ import tn.loukious.facebookappadsremover.core.L
 import io.github.libxposed.api.XposedInterface
 import io.github.libxposed.api.XposedInterface.Hooker
 import org.json.JSONArray
+import java.io.File
 import java.lang.reflect.Field
 import java.lang.reflect.Modifier
 
@@ -35,10 +36,12 @@ import java.lang.reflect.Modifier
  *   mUsername             → FBUSERNAME     (pref only — no in-memory static)
  *   mUserId               → FBUSERID
  *
- * The original mod waited for cookies, token and user ID before unhooking.
- * Some Facebook builds never provide cookies, so this port finishes after
- * capturing token/user ID and treats cookies and username as best-effort.
- * Unchanged values produce no preference writes or update logs.
+ * The original mod unhooked after its first capture. This port keeps the
+ * (sampled) hook so it follows account switches and token refreshes, stores
+ * token and user ID only as a pair (see AccountCaptureState), skips page
+ * contexts, and clears everything once Facebook's session file is gone
+ * (logout). Cookies and username are best-effort; unchanged values produce
+ * no preference writes or update logs.
  *
  * Nothing here needs DexKit: ViewerContext is a stable com.facebook.* class
  * in the secondary dex (verified present with identical field names in stock
@@ -64,31 +67,60 @@ object AccountHook {
 
     private lateinit var prefs: SharedPreferences
 
-    /** The hooked equals() methods — unhooked once the capture is complete. */
+    /**
+     * The hooked equals() methods. They stay installed for the process
+     * lifetime so account switches and token refreshes are picked up; the
+     * callback samples at most once per [SAMPLE_INTERVAL_MS].
+     */
     private val hookHandles = ArrayList<XposedInterface.HookHandle>()
+
+    private const val SAMPLE_INTERVAL_MS = 2_000L
+    private const val LOGOUT_CHECK_INTERVAL_MS = 30_000L
+    @Volatile private var lastSample = 0L
+    @Volatile private var lastLogoutCheck = 0L
+
+    /** Facebook's active-session file; missing or empty means logged out. */
+    private var authFile: File? = null
 
     private val captureState = AccountCaptureState(
         persist = { changed ->
             runCatching {
                 val editor = prefs.edit()
-                for ((key, value) in changed) editor.putString(key, value)
+                for ((key, value) in changed) {
+                    if (value == null) editor.remove(key) else editor.putString(key, value)
+                }
                 editor.apply()
             }.onFailure { L.w(TAG, "account preference update failed", it) }
         },
         log = { L.i(TAG, it) },
         warn = { L.w(TAG, it) },
         decodeCookies = ::jsonToHttpCookie,
-        onComplete = {
-            for (handle in hookHandles) {
-                runCatching { handle.unhook() }
-                    .onFailure { L.w(TAG, "Could not detach account hook; capture is disabled", it) }
-            }
-            hookHandles.clear()
-        },
     )
 
     fun init(context: Context) {
         prefs = context.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
+        authFile = runCatching {
+            File(context.dataDir, "app_light_prefs").walkTopDown().maxDepth(2)
+                .firstOrNull { it.isFile && it.name == "authentication" }
+        }.getOrNull()
+        // Credentials captured before a logout that happened while the
+        // process was dead must not survive into this session.
+        clearIfLoggedOut(force = true)
+    }
+
+    private fun clearIfLoggedOut(force: Boolean = false) {
+        val now = System.currentTimeMillis()
+        if (!force && now - lastLogoutCheck < LOGOUT_CHECK_INTERVAL_MS) return
+        lastLogoutCheck = now
+        val loggedOut = authFile?.let { !it.isFile || it.length() == 0L }
+            // Never seen a session file: nothing to compare against.
+            ?: return
+        if (!loggedOut) return
+        captureState.clear()
+        if (this::prefs.isInitialized) {
+            // Also drop values persisted by an earlier process.
+            runCatching { prefs.edit().clear().apply() }
+        }
     }
 
     /**
@@ -99,7 +131,7 @@ object AccountHook {
      */
     @Synchronized
     fun install(module: XposedInterface, classLoader: ClassLoader): Boolean {
-        if (captureState.completed || hookHandles.isNotEmpty()) return true
+        if (hookHandles.isNotEmpty()) return true
         val cls = runCatching {
             Class.forName(VIEWER_CONTEXT_CLASS, false, classLoader)
         }.getOrNull() ?: return false
@@ -123,6 +155,12 @@ object AccountHook {
                 fields[name] = f
             }.onFailure { L.w(TAG, "field missing: $name", it) }
         }
+        // Optional: page ("act as page") contexts carry the page's ID/token
+        // and must not replace the user's account.
+        runCatching {
+            cls.getDeclaredField(PAGE_CONTEXT_FIELD).also { it.isAccessible = true }
+        }.onSuccess { fields[PAGE_CONTEXT_FIELD] = it }
+            .onFailure { L.w(TAG, "no $PAGE_CONTEXT_FIELD; page contexts can't be filtered") }
 
         // Publish fields before enabling any callback. Installation and
         // capture share a lock so completion cannot race handle registration.
@@ -149,16 +187,27 @@ object AccountHook {
      */
     private object CaptureHooker : Hooker {
         override fun intercept(chain: XposedInterface.Chain): Any? {
-            runCatching { capture(chain.thisObject) }
-                .onFailure { L.w(TAG, "capture failed", it) }
+            // equals() runs constantly; sampling keeps the hook cheap while
+            // still following account switches within a couple of seconds.
+            val now = System.currentTimeMillis()
+            if (now - lastSample >= SAMPLE_INTERVAL_MS) {
+                lastSample = now
+                runCatching { capture(chain.thisObject) }
+                    .onFailure { L.w(TAG, "capture failed", it) }
+            }
             return chain.proceed()
         }
     }
 
-    /** Capture changed fields and detach once the required credentials exist. */
+    private const val PAGE_CONTEXT_FIELD = "mIsPageContext"
+
+    /** Capture changed fields of the signed-in user's ViewerContext. */
     @Synchronized
     private fun capture(viewerContext: Any?) {
-        if (viewerContext == null || captureState.completed) return
+        clearIfLoggedOut()
+        if (viewerContext == null) return
+        val isPage = fields[PAGE_CONTEXT_FIELD]?.let { runCatching { it.getBoolean(viewerContext) }.getOrNull() }
+        if (isPage == true) return
         captureState.capture(AccountCaptureState.Snapshot(
             token = stringField(viewerContext, "mAuthToken"),
             userId = stringField(viewerContext, "mUserId"),

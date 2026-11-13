@@ -12,20 +12,17 @@ import java.util.concurrent.TimeUnit
 class AccountCaptureStateTest {
     private class Capture(
         decode: (String) -> String? = { "session=example" },
-        complete: () -> Unit = {},
-        persist: (Map<String, String>) -> Unit = {},
+        persist: (Map<String, String?>) -> Unit = {},
     ) {
-        val writes = ArrayList<Map<String, String>>()
+        val writes = ArrayList<Map<String, String?>>()
         val logs = ArrayList<String>()
         val warnings = ArrayList<String>()
         var decodes = 0
-        var completions = 0
         val state = AccountCaptureState(
             persist = { writes.add(it.toMap()); persist(it) },
             log = { logs.add(it) },
             warn = { warnings.add(it) },
             decodeCookies = { decodes++; decode(it) },
-            onComplete = { completions++; complete() },
         )
     }
 
@@ -37,7 +34,6 @@ class AccountCaptureStateTest {
             ))
             assertTrue(capture.state.completed)
             assertEquals("test-token", capture.state.authToken)
-            assertEquals(1, capture.completions)
             assertEquals(listOf(mapOf("auth_token" to "test-token", "user_id" to "test-user")), capture.writes)
             assertEquals(1, capture.warnings.size)
             assertEquals(0, capture.decodes)
@@ -54,7 +50,6 @@ class AccountCaptureStateTest {
         assertEquals(logs, capture.logs)
         assertEquals(1, capture.warnings.size)
         assertFalse(capture.state.completed)
-        assertEquals(0, capture.completions)
     }
 
     @Test fun laterUserIdCompletesAPartialCapture() {
@@ -63,7 +58,6 @@ class AccountCaptureStateTest {
         capture.state.capture(AccountCaptureState.Snapshot(token = "test-token", userId = "test-user"))
         assertTrue(capture.state.completed)
         assertEquals(listOf(mapOf("auth_token" to "test-token"), mapOf("user_id" to "test-user")), capture.writes)
-        assertEquals(1, capture.completions)
     }
 
     @Test fun blankValuesNeitherCompleteCaptureNorEraseCapturedValues() {
@@ -109,7 +103,6 @@ class AccountCaptureStateTest {
         assertEquals(1, capture.warnings.size)
         capture.state.capture(snapshot.copy(userId = "test-user"))
         assertTrue(capture.state.completed)
-        assertEquals(1, capture.completions)
     }
 
     @Test fun completeCaptureBatchesAllAvailableFieldsInOneWrite() {
@@ -122,19 +115,62 @@ class AccountCaptureStateTest {
         )), capture.writes)
     }
 
-    @Test fun queuedCallbacksAfterCompletionAreInert() {
+    @Test fun partialSnapshotsAfterCompletionCannotChangeTheAccount() {
         val capture = Capture()
         capture.state.capture(AccountCaptureState.Snapshot(token = "test-token", userId = "test-user"))
         val logs = capture.logs.toList()
         repeat(10_000) {
-            capture.state.capture(AccountCaptureState.Snapshot("different", "different", "different", "different"))
+            capture.state.capture(AccountCaptureState.Snapshot(token = "different", username = "different", cookies = "different"))
+            capture.state.capture(AccountCaptureState.Snapshot(userId = "different"))
         }
         assertEquals(1, capture.writes.size)
         assertEquals(logs, capture.logs)
-        assertEquals(1, capture.warnings.size)
-        assertEquals(1, capture.completions)
         assertEquals(0, capture.decodes)
         assertEquals("test-token", capture.state.authToken)
+    }
+
+    @Test fun sameUserTokenRefreshUpdatesOnlyTheToken() {
+        val capture = Capture()
+        capture.state.capture(AccountCaptureState.Snapshot("old-token", "test-user", "test-name"))
+        capture.state.capture(AccountCaptureState.Snapshot("new-token", "test-user", "test-name"))
+        assertEquals(mapOf("auth_token" to "new-token"), capture.writes.last())
+        assertEquals("new-token", capture.state.authToken)
+        assertTrue(capture.state.completed)
+    }
+
+    @Test fun accountSwitchReplacesTheWholeRecordAndDropsStaleValues() {
+        val capture = Capture()
+        capture.state.capture(AccountCaptureState.Snapshot("token-a", "user-a", "name-a", "[a]"))
+        capture.state.capture(AccountCaptureState.Snapshot(token = "token-b", userId = "user-b"))
+        assertEquals(mapOf(
+            "auth_token" to "token-b", "user_id" to "user-b",
+            "username" to null, "cookie_json" to null, "cookie_http" to null,
+        ), capture.writes.last())
+        assertEquals("token-b", capture.state.authToken)
+        assertTrue(capture.state.completed)
+        assertTrue(capture.logs.contains("ViewerContext account changed"))
+    }
+
+    @Test fun accountSwitchKeepsNewValuesThatMatchTheOldAccount() {
+        val capture = Capture()
+        capture.state.capture(AccountCaptureState.Snapshot("token-a", "user-a", "same-name"))
+        capture.state.capture(AccountCaptureState.Snapshot("token-b", "user-b", "same-name"))
+        assertEquals("same-name", capture.writes.last()["username"])
+    }
+
+    @Test fun clearRemovesEveryValueAndAllowsAFreshCapture() {
+        val capture = Capture()
+        capture.state.capture(AccountCaptureState.Snapshot("test-token", "test-user", "test-name"))
+        capture.state.clear()
+        assertEquals(mapOf("auth_token" to null, "user_id" to null, "username" to null), capture.writes.last())
+        assertFalse(capture.state.completed)
+        assertNull(capture.state.authToken)
+        val writes = capture.writes.size
+        capture.state.clear()
+        assertEquals(writes, capture.writes.size)
+        capture.state.capture(AccountCaptureState.Snapshot(token = "next-token", userId = "next-user"))
+        assertTrue(capture.state.completed)
+        assertEquals("next-token", capture.state.authToken)
     }
 
     @Test fun concurrentCallbacksCompleteAndPersistOnlyOnce() {
@@ -152,21 +188,10 @@ class AccountCaptureStateTest {
             futures.forEach { it.get(5, TimeUnit.SECONDS) }
             assertTrue(capture.state.completed)
             assertEquals(1, capture.writes.size)
-            assertEquals(1, capture.completions)
             assertEquals(1, capture.warnings.size)
         } finally {
             executor.shutdownNow()
         }
-    }
-
-    @Test fun failedUnhookCannotRestartCapture() {
-        val capture = Capture(complete = { error("Framework unhook failed") })
-        val snapshot = AccountCaptureState.Snapshot(token = "test-token", userId = "test-user")
-        assertTrue(runCatching { capture.state.capture(snapshot) }.isFailure)
-        repeat(1_000) { capture.state.capture(snapshot) }
-        assertTrue(capture.state.completed)
-        assertEquals(1, capture.completions)
-        assertEquals(1, capture.writes.size)
     }
 
     @Test fun persistenceFailureCannotCauseRepeatedWriteAttempts() {
@@ -175,7 +200,6 @@ class AccountCaptureStateTest {
         assertTrue(runCatching { capture.state.capture(snapshot) }.isFailure)
         repeat(1_000) { capture.state.capture(snapshot) }
         assertEquals(1, capture.writes.size)
-        assertEquals(1, capture.completions)
         assertTrue(capture.state.completed)
     }
 
