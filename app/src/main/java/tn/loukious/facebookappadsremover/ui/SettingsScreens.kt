@@ -10,6 +10,7 @@ import androidx.compose.animation.shrinkVertically
 import androidx.compose.animation.slideInHorizontally
 import androidx.compose.animation.slideOutHorizontally
 import androidx.compose.animation.togetherWith
+import androidx.compose.foundation.clickable
 import androidx.compose.foundation.BorderStroke
 import androidx.compose.foundation.Image
 import androidx.compose.foundation.layout.Arrangement
@@ -451,7 +452,10 @@ private fun AboutScreen(model: SettingsModel, back: () -> Unit) {
             RowGroup(model.contributors.map<Pair<Contributor, ImageBitmap?>, @Composable (androidx.compose.ui.graphics.Shape) -> Unit> { (c, avatar) ->
                 { shape -> ContributorRow(shape, c, avatar) { model.openUrl(c.url) } }
             })
-            Footnote("Settings design inspired by GPlay Adblock by hxreborn.")
+            Footnote(
+                "Original design by hxreborn",
+                Modifier.clickable { model.openUrl("https://github.com/hxreborn") },
+            )
         }
     }
 }
