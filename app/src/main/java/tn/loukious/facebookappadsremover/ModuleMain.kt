@@ -243,6 +243,8 @@ class ModuleMain : XposedModule() {
     private var darkActivityHookTried = false
     private var amoledResolversReady = false
     private var newsfeedUiFallbackReady = false
+    private var bloksProbeReady = false
+    private var bookmarkProbeReady = false
     private var navigationTabNativeReady = false
     private var discoveryRan = false
 
@@ -267,6 +269,21 @@ class ModuleMain : XposedModule() {
         }
         if (!navigationTabNativeReady) {
             navigationTabNativeReady = NavigationTabHook.installNative(this, classLoader)
+        }
+        // RESEARCH ONLY (feature/menu-hiding): dump side-menu Bloks trees.
+        if (!bookmarkProbeReady) {
+            bookmarkProbeReady = tn.loukious.facebookappadsremover.hooks.BloksProbeHook.installBookmarkData(this, classLoader)
+            tn.loukious.facebookappadsremover.hooks.BloksProbeHook.startViewScan()
+        }
+        if (!bloksProbeReady) {
+            val app = runCatching {
+                Class.forName("android.app.ActivityThread").getMethod("currentApplication").invoke(null) as? Context
+            }.getOrNull()
+            if (app != null) {
+                bloksProbeReady = tn.loukious.facebookappadsremover.hooks.BloksProbeHook.install(
+                    this, classLoader, listOfNotNull(findSecondaryDexZip(app), app.applicationInfo.sourceDir).distinct(),
+                )
+            }
         }
         // M4: video params capture — stable class name, needs only the
         // secondary dexes to attach (same cadence as the account hook).
@@ -907,7 +924,7 @@ class ModuleMain : XposedModule() {
      * (the archive is regenerated lazily, sometimes never) and are ignored —
      * their class names no longer resolve in the current classloader.
      */
-    private fun findSecondaryDexZip(context: Context?): String? {
+    internal fun findSecondaryDexZip(context: Context?): String? {
         if (context == null) return null
         return runCatching {
             val installedAt = context.applicationInfo?.sourceDir
