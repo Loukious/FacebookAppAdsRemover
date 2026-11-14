@@ -1555,8 +1555,7 @@ object DownloadHook {
 
     /** Cookie for the page fetch (mod prefs FBHTTPCOOKIE/loginCookie). */
     private fun sessionCookie(): String? =
-        appContext.getSharedPreferences("fbar_account", Context.MODE_PRIVATE)
-            .getString(tn.loukious.facebookappadsremover.hooks.AccountHook.KEY_COOKIE_HTTP, null)
+        AccountHook.httpCookie()
             ?.takeIf { it.isNotBlank() }
 
     /**

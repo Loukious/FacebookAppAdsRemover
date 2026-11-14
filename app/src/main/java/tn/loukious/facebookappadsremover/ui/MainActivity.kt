@@ -16,6 +16,8 @@ import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.graphics.ImageBitmap
 import androidx.compose.ui.graphics.asImageBitmap
+import androidx.lifecycle.Lifecycle
+import androidx.lifecycle.ViewModelProvider
 import io.github.libxposed.service.XposedService
 import io.github.libxposed.service.XposedServiceHelper
 import tn.loukious.facebookappadsremover.core.AdSettingsMigration
@@ -43,6 +45,12 @@ import tn.loukious.facebookappadsremover.core.Settings
 class MainActivity : ComponentActivity(), SettingsModel {
 
     private var prefs: SharedPreferences? = null
+    private val ui by lazy { ViewModelProvider(this)[SettingsUiViewModel::class.java] }
+    private val uiListener = SharedPreferences.OnSharedPreferenceChangeListener { _, _ ->
+        ui.refresh()
+        if (lifecycle.currentState.isAtLeast(Lifecycle.State.RESUMED)) handlePendingReport()
+    }
+    private var reportTimeout: Runnable? = null
 
     // ------------------------------------------------------------- state --
 
@@ -53,8 +61,7 @@ class MainActivity : ComponentActivity(), SettingsModel {
     override var bound by mutableStateOf(false)
         private set
     /** Something changed since the last Apply: shows the Apply row. */
-    override var changed by mutableStateOf(false)
-        private set
+    override val changed: Boolean get() = ui.changed
     override var keywords by mutableStateOf("")
         private set
     override var launcherVisible by mutableStateOf(true)
@@ -69,8 +76,7 @@ class MainActivity : ComponentActivity(), SettingsModel {
 
     private val values = mutableStateMapOf<String, Boolean>()
 
-    override var reportLoading by mutableStateOf(false)
-        private set
+    override val reportLoading: Boolean get() = ui.report != null
 
     /**
      * System file browser for importing a specific session export. The FB
@@ -85,14 +91,12 @@ class MainActivity : ComponentActivity(), SettingsModel {
         enableEdgeToEdge()
         super.onCreate(savedInstanceState)
         launcherVisible = LauncherIcon.isVisible(this)
-        setContent { SettingsTheme { SettingsApp(this) } }
-        SessionResultReceiver.reportListener = { text ->
-            runOnUiThread {
-                reportLoading = false
-                onReport?.invoke(text)
-                onReport = null
-            }
+        // A fresh launch can recover a picker whose task was discarded; a
+        // recreated activity lets ActivityResultRegistry deliver its result.
+        ui.store.report?.takeIf { savedInstanceState == null && it.phase == ReportPhase.PICKER }?.let {
+            ui.store.report = it.copy(phase = ReportPhase.READY)
         }
+        setContent { SettingsTheme { SettingsApp(this) } }
 
         // No bind within a few seconds: the framework doesn't know this
         // module (not enabled in LSPosed/Vector), so say so instead of
@@ -139,7 +143,7 @@ class MainActivity : ComponentActivity(), SettingsModel {
     override fun setOn(spec: ToggleSpec, on: Boolean) {
         values[spec.key] = on
         prefs?.edit()?.putBoolean(spec.key, on)?.apply()
-        changed = true
+        ui.markChanged()
     }
 
     /**
@@ -151,7 +155,7 @@ class MainActivity : ComponentActivity(), SettingsModel {
         if (value == keywords) return
         keywords = value
         prefs?.edit()?.putString(Settings.FEED_KEYWORDS, value)?.apply()
-        changed = true
+        ui.markChanged()
     }
 
     /**
@@ -165,102 +169,171 @@ class MainActivity : ComponentActivity(), SettingsModel {
     }
 
     /**
-     * One-tap apply: the module's receiver inside Facebook (SessionBackup,
-     * signature-protected) makes Facebook exit, then Facebook is started
-     * again here. If Facebook wasn't running, it simply starts.
+     * Preparation gathers running processes without terminating them. The
+     * ViewModel waits for all acknowledged processes to die before this
+     * activity relaunches Facebook, including across activity recreation.
      */
     override fun restartFacebook() {
-        val launch = packageManager.getLaunchIntentForPackage(FACEBOOK)
-        if (launch == null) {
+        if (packageManager.getLaunchIntentForPackage(FACEBOOK) == null) {
             Toast.makeText(this, "Facebook isn't installed", Toast.LENGTH_SHORT).show()
             return
         }
-        runCatching { sendBroadcast(Intent(SessionBackup.ACTION_RESTART).setPackage(FACEBOOK)) }
-        changed = false
+        if (!ui.beginRestart()) return
         Toast.makeText(this, "Restarting Facebook…", Toast.LENGTH_SHORT).show()
-        window.decorView.postDelayed({
-            launch.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK or Intent.FLAG_ACTIVITY_CLEAR_TASK)
-            runCatching { startActivity(launch) }
-        }, 1500)
     }
 
-    /** What to do with the report once Facebook sends it. */
-    private var onReport: ((String) -> Unit)? = null
-    /** Increments per request so a stale timeout never cancels a newer one. */
-    private var reportRequest = 0
-    private var reportToSave: String? = null
+    private fun handleRestartResult() {
+        val outcome = ui.takeRestartResult() ?: return
+        if (outcome.result == FacebookRestartController.Result.FAILED) {
+            Toast.makeText(this, "Couldn't confirm the restart. Changes are still pending.", Toast.LENGTH_LONG).show()
+            return
+        }
+        val launched = runCatching {
+            val launch = checkNotNull(packageManager.getLaunchIntentForPackage(FACEBOOK))
+            startActivity(launch.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK or Intent.FLAG_ACTIVITY_CLEAR_TASK))
+        }.isSuccess
+        if (!launched) {
+            Toast.makeText(this, "Couldn't open Facebook. Changes are still pending.", Toast.LENGTH_LONG).show()
+        } else if (outcome.result == FacebookRestartController.Result.CONFIRMED) {
+            if (!ui.markApplied(outcome.revision)) {
+                Toast.makeText(this, "Facebook restarted. Newer changes still need applying.", Toast.LENGTH_LONG).show()
+            }
+        } else {
+            // No receiver can mean a cold app or a module update that has not
+            // loaded yet. Opening it alone does not prove an old process exited.
+            Toast.makeText(this, "Facebook opened. Return here to apply changes; if needed, close Facebook fully first.", Toast.LENGTH_LONG).show()
+        }
+    }
 
     private val createReportFile = registerForActivityResult(
         ActivityResultContracts.CreateDocument("text/plain"),
     ) { uri ->
-        val text = reportToSave
-        reportToSave = null
-        if (uri == null || text == null) return@registerForActivityResult
+        val request = ui.store.report?.takeIf { it.phase == ReportPhase.PICKER }
+            ?: return@registerForActivityResult
+        val file = ui.store.reportFile(request)
+        if (uri == null) {
+            ui.store.clearReport()
+            return@registerForActivityResult
+        }
         val ok = runCatching {
-            contentResolver.openOutputStream(uri)?.use { it.write(text.toByteArray()) } != null
+            check(file?.isFile == true)
+            contentResolver.openOutputStream(uri)?.use { output ->
+                file!!.inputStream().use { it.copyTo(output) }
+            } != null
         }.getOrDefault(false)
+        ui.store.clearReport()
         Toast.makeText(this, if (ok) "Report saved" else "Couldn't save the report", Toast.LENGTH_SHORT).show()
     }
 
-    private fun reportFileName(): String {
-        val stamp = java.text.SimpleDateFormat("yyyyMMdd-HHmmss", java.util.Locale.US).format(java.util.Date())
-        return "FBAR-diagnostics-$stamp.txt"
-    }
-
     /**
-     * Ask Facebook for its module log (collected inside Facebook's process,
-     * no computer needed), then run [then] with it.
+     * Track the operation before sending it. Both its purpose and the reply
+     * survive recreation, and a late reply cannot fulfil a newer request.
      */
-    private fun fetchReport(then: (String) -> Unit) {
-        if (reportLoading) return
-        val nonce = SessionResultReceiver.newRequestNonce(this)
+    private fun fetchReport(action: ReportAction) {
+        if (ui.store.report != null) {
+            handlePendingReport()
+            return
+        }
+        val kind = if (action == ReportAction.SAVE) SessionRequestKind.DIAGNOSTICS_SAVE
+            else SessionRequestKind.DIAGNOSTICS_SHARE
+        val nonce = SessionResultReceiver.newRequestNonce(this, kind)
+        ui.store.report = DiagnosticsRequest(nonce, action, android.os.SystemClock.elapsedRealtime())
         val intent = Intent(SessionBackup.ACTION_DIAGNOSTICS).setPackage(FACEBOOK)
+            .addFlags(Intent.FLAG_RECEIVER_FOREGROUND)
             .putExtra(SessionBackup.EXTRA_NONCE, nonce)
         if (runCatching { sendBroadcast(intent) }.isFailure) {
             SessionResultReceiver.cancelRequestNonce(this, nonce)
+            ui.store.clearReport()
+            Toast.makeText(this, "Couldn't request the report", Toast.LENGTH_SHORT).show()
             return
         }
-        onReport = then
-        reportLoading = true
-        val request = ++reportRequest
-        // Facebook only answers while running; say so instead of spinning.
-        window.decorView.postDelayed({
-            if (reportLoading && request == reportRequest) {
-                reportLoading = false
-                onReport = null
-                SessionResultReceiver.cancelRequestNonce(this, nonce)
-                Toast.makeText(
-                    this,
-                    "Facebook didn't answer. Open Facebook once, then try again.",
-                    Toast.LENGTH_LONG,
-                ).show()
+        handlePendingReport()
+    }
+
+    override fun saveReport() = fetchReport(ReportAction.SAVE)
+
+    override fun shareReport() = fetchReport(ReportAction.SHARE)
+
+    private fun handlePendingReport() {
+        reportTimeout?.let(window.decorView::removeCallbacks)
+        reportTimeout = null
+        val request = ui.store.report ?: return
+        if (request.phase == ReportPhase.PICKER) return
+        if (request.phase == ReportPhase.WAITING) {
+            val now = android.os.SystemClock.elapsedRealtime()
+            if (request.expired(now)) {
+                SessionResultReceiver.cancelRequestNonce(this, request.nonce)
+                ui.store.clearReport()
+                Toast.makeText(this, "Facebook didn't answer. Open Facebook once, then try again.", Toast.LENGTH_LONG).show()
+            } else {
+                reportTimeout = Runnable { handlePendingReport() }.also {
+                    window.decorView.postDelayed(it, DiagnosticsRequest.TIMEOUT_MILLIS - (now - request.startedAt))
+                }
             }
-        }, 6000)
-    }
-
-    override fun saveReport() = fetchReport { text ->
-        reportToSave = text
-        createReportFile.launch(reportFileName())
-    }
-
-    /** Shares the report as a .txt attachment (for an issue or a chat). */
-    override fun shareReport() = fetchReport { text ->
-        runCatching {
-            val dir = java.io.File(cacheDir, "reports").apply { mkdirs() }
-            dir.listFiles()?.forEach { it.delete() }
-            val file = java.io.File(dir, reportFileName()).apply { writeText(text) }
-            val uri = androidx.core.content.FileProvider.getUriForFile(this, "$packageName.reports", file)
+            return
+        }
+        val file = ui.store.reportFile(request)
+        if (file?.isFile != true) {
+            ui.store.clearReport()
+            Toast.makeText(this, "The cached report is unavailable. Request a new report.", Toast.LENGTH_LONG).show()
+            return
+        }
+        if (request.action == ReportAction.SAVE) {
+            ui.store.report = request.copy(phase = ReportPhase.PICKER)
+            runCatching { createReportFile.launch(reportFileName(file)) }.onFailure {
+                ui.store.clearReport()
+                Toast.makeText(this, "Couldn't open the save dialog", Toast.LENGTH_SHORT).show()
+            }
+            return
+        }
+        val shared = runCatching {
+            val uri = androidx.core.content.FileProvider.getUriForFile(this, "$packageName.reports", file, reportFileName(file))
             val send = Intent(Intent.ACTION_SEND).setType("text/plain")
                 .putExtra(Intent.EXTRA_SUBJECT, "Facebook App Ads Remover diagnostics")
                 .putExtra(Intent.EXTRA_STREAM, uri)
                 .addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION)
             startActivity(Intent.createChooser(send, "Share report"))
-        }.onFailure { Toast.makeText(this, "Couldn't share the report", Toast.LENGTH_SHORT).show() }
+        }.isSuccess
+        // Keep the file backing the URI grant after launching the chooser.
+        ui.store.clearReport(deleteFile = !shared)
+        if (!shared) Toast.makeText(this, "Couldn't share the report", Toast.LENGTH_SHORT).show()
+    }
+
+    override fun onStart() {
+        super.onStart()
+        ui.store.preferences.registerOnSharedPreferenceChangeListener(uiListener)
+        ui.refresh()
+    }
+
+    override fun onResume() {
+        super.onResume()
+        ui.refresh()
+        ui.onRestartReady = ::handleRestartResult
+        handleRestartResult()
+        handlePendingReport()
+    }
+
+    override fun onPause() {
+        ui.onRestartReady = null
+        super.onPause()
+    }
+
+    override fun onStop() {
+        ui.store.preferences.unregisterOnSharedPreferenceChangeListener(uiListener)
+        reportTimeout?.let(window.decorView::removeCallbacks)
+        reportTimeout = null
+        super.onStop()
     }
 
     override fun onDestroy() {
-        SessionResultReceiver.reportListener = null
+        reportTimeout?.let(window.decorView::removeCallbacks)
         super.onDestroy()
+    }
+
+    private fun reportFileName(file: java.io.File): String {
+        val stamp = java.text.SimpleDateFormat("yyyyMMdd-HHmmss", java.util.Locale.US)
+            .format(java.util.Date(file.lastModified()))
+        return "FBAR-diagnostics-$stamp.txt"
     }
 
     override fun openUrl(url: String) {
@@ -281,7 +354,8 @@ class MainActivity : ComponentActivity(), SettingsModel {
     }
 
     private fun sendSession(action: String) {
-        val nonce = SessionResultReceiver.newRequestNonce(this)
+        val kind = if (action == SessionBackup.ACTION_EXPORT) SessionRequestKind.EXPORT else SessionRequestKind.IMPORT
+        val nonce = SessionResultReceiver.newRequestNonce(this, kind)
         val intent = Intent(action).setPackage(FACEBOOK).putExtra(SessionBackup.EXTRA_NONCE, nonce)
         val sent = runCatching { sendBroadcast(intent) }.isSuccess
         if (!sent) SessionResultReceiver.cancelRequestNonce(this, nonce)
@@ -307,7 +381,7 @@ class MainActivity : ComponentActivity(), SettingsModel {
             Toast.makeText(this, "That doesn't look like a session export", Toast.LENGTH_LONG).show()
             return
         }
-        val nonce = SessionResultReceiver.newRequestNonce(this)
+        val nonce = SessionResultReceiver.newRequestNonce(this, SessionRequestKind.IMPORT)
         val intent = Intent(SessionBackup.ACTION_IMPORT_DATA)
             .setPackage(FACEBOOK)
             .putExtra(SessionBackup.EXTRA_DATA, text)

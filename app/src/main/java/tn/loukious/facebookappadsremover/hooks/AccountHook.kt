@@ -6,8 +6,8 @@ import tn.loukious.facebookappadsremover.core.L
 import io.github.libxposed.api.XposedInterface
 import io.github.libxposed.api.XposedInterface.Hooker
 import org.json.JSONArray
-import java.lang.reflect.Field
 import java.lang.reflect.Modifier
+import android.os.SystemClock
 
 /**
  * M3 account tools — port of the original mod's ViewerContext installer
@@ -35,10 +35,11 @@ import java.lang.reflect.Modifier
  *   mUsername             → FBUSERNAME     (pref only — no in-memory static)
  *   mUserId               → FBUSERID
  *
- * The original mod waited for cookies, token and user ID before unhooking.
- * Some Facebook builds never provide cookies, so this port finishes after
- * capturing token/user ID and treats cookies and username as best-effort.
- * Unchanged values produce no preference writes or update logs.
+ * The sampled equals() hook is only a wake-up signal. Credentials come from
+ * an atomic snapshot of Facebook's current authentication store, fetched
+ * through its factory each time; retained ViewerContexts and replaced store
+ * objects cannot restore an old account. No persisted credentials are used
+ * until the current session is verified. See [AuthenticationStoreSource].
  *
  * Nothing here needs DexKit: ViewerContext is a stable com.facebook.* class
  * in the secondary dex (verified present with identical field names in stock
@@ -61,34 +62,97 @@ object AccountHook {
 
     /** Stable secondary-dex class name (no discovery cache needed). */
     const val VIEWER_CONTEXT_CLASS = "com.facebook.auth.viewercontext.ViewerContext"
+    private const val LIGHT_PREFS_CLASS = "com.facebook.crudolib.prefs.LightSharedPreferencesImpl"
 
     private lateinit var prefs: SharedPreferences
 
-    /** The hooked equals() methods — unhooked once the capture is complete. */
+    /**
+     * The hooked equals() methods. They stay installed for the process
+     * lifetime so account switches and token refreshes are picked up; the
+     * callback samples at most once per [SAMPLE_INTERVAL_MS].
+     */
     private val hookHandles = ArrayList<XposedInterface.HookHandle>()
+    private val sourceHookHandles = ArrayList<XposedInterface.HookHandle>()
+    private val sessionSource = AuthenticationStoreSource()
+
+    private const val SAMPLE_INTERVAL_MS = 2_000L
+    @Volatile private var lastSample: Long? = null
 
     private val captureState = AccountCaptureState(
         persist = { changed ->
             runCatching {
                 val editor = prefs.edit()
-                for ((key, value) in changed) editor.putString(key, value)
+                for ((key, value) in changed) {
+                    if (value == null) editor.remove(key) else editor.putString(key, value)
+                }
                 editor.apply()
             }.onFailure { L.w(TAG, "account preference update failed", it) }
         },
         log = { L.i(TAG, it) },
         warn = { L.w(TAG, it) },
         decodeCookies = ::jsonToHttpCookie,
-        onComplete = {
-            for (handle in hookHandles) {
-                runCatching { handle.unhook() }
-                    .onFailure { L.w(TAG, "Could not detach account hook; capture is disabled", it) }
-            }
-            hookHandles.clear()
-        },
     )
 
+    @Synchronized
     fun init(context: Context) {
         prefs = context.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
+        // A previous process's credentials are unverified, including when
+        // authentication never existed or disappeared while the app was dead.
+        captureState.clear()
+        refreshSession()
+    }
+
+    /**
+     * Install on the bootstrap class before Application.onCreate so the
+     * authentication factory is observed even if Facebook caches its context
+     * during startup. The getString hook also permits a later installation.
+     */
+    @Synchronized
+    fun installSessionSource(module: XposedInterface, classLoader: ClassLoader): Boolean {
+        if (sourceHookHandles.isNotEmpty()) return true
+        val cls = runCatching { Class.forName(LIGHT_PREFS_CLASS, false, classLoader) }
+            .getOrNull() ?: return false
+        val nameField = runCatching { cls.getDeclaredField("_name").apply { isAccessible = true } }
+            .getOrNull() ?: return false
+
+        // The Provider captures the factory whose String -> preferences
+        // getter returns its canonical entry, including replacements.
+        for (constructor in cls.declaredConstructors) {
+            val providerIndex = constructor.parameterTypes.indexOfFirst { it.name == "javax.inject.Provider" }
+            if (providerIndex < 0) continue
+            runCatching {
+                constructor.isAccessible = true
+                sourceHookHandles.add(module.hook(constructor).intercept(object : Hooker {
+                    override fun intercept(chain: XposedInterface.Chain): Any? {
+                        val result = chain.proceed()
+                        runCatching {
+                            if (nameField.get(chain.thisObject) == "authentication") {
+                                chain.args.getOrNull(providerIndex)?.let { sessionSource.observe(it, cls) }
+                            }
+                        }
+                        return result
+                    }
+                }))
+            }.onFailure { L.w(TAG, "authentication constructor hook failed", it) }
+        }
+        runCatching {
+            val getter = cls.getDeclaredMethod("getString", String::class.java, String::class.java)
+            sourceHookHandles.add(module.hook(getter).intercept(object : Hooker {
+                override fun intercept(chain: XposedInterface.Chain): Any? {
+                    val result = chain.proceed()
+                    runCatching {
+                        val store = chain.thisObject
+                        if (store != null && nameField.get(store) == "authentication") {
+                            sessionSource.observeStore(store)
+                        }
+                    }
+                    return result
+                }
+            }))
+        }.onFailure { L.w(TAG, "authentication getter hook failed", it) }
+        if (sourceHookHandles.isEmpty()) return false
+        L.i(TAG, "authentication store observer installed")
+        return true
     }
 
     /**
@@ -99,7 +163,8 @@ object AccountHook {
      */
     @Synchronized
     fun install(module: XposedInterface, classLoader: ClassLoader): Boolean {
-        if (captureState.completed || hookHandles.isNotEmpty()) return true
+        if (!installSessionSource(module, classLoader)) return false
+        if (hookHandles.isNotEmpty()) return true
         val cls = runCatching {
             Class.forName(VIEWER_CONTEXT_CLASS, false, classLoader)
         }.getOrNull() ?: return false
@@ -115,18 +180,6 @@ object AccountHook {
             return false
         }
 
-        val fields = HashMap<String, Field>(4)
-        for (name in listOf("mSessionCookiesString", "mAuthToken", "mUsername", "mUserId")) {
-            runCatching {
-                val f = cls.getDeclaredField(name)
-                f.isAccessible = true
-                fields[name] = f
-            }.onFailure { L.w(TAG, "field missing: $name", it) }
-        }
-
-        // Publish fields before enabling any callback. Installation and
-        // capture share a lock so completion cannot race handle registration.
-        this.fields = fields
         var installed = 0
         for (m in targets) {
             runCatching {
@@ -141,44 +194,49 @@ object AccountHook {
         return true
     }
 
-    private var fields: Map<String, Field> = emptyMap()
-
     /**
      * bsrncODWYJ5TNENFG95a.beforeHookedMethod port: observe, capture, never
      * alter the original result.
      */
     private object CaptureHooker : Hooker {
         override fun intercept(chain: XposedInterface.Chain): Any? {
-            runCatching { capture(chain.thisObject) }
-                .onFailure { L.w(TAG, "capture failed", it) }
+            // equals() runs constantly; sampling keeps the hook cheap while
+            // still following account switches within a couple of seconds.
+            val now = SystemClock.elapsedRealtime()
+            val last = lastSample
+            if (last == null || now - last >= SAMPLE_INTERVAL_MS) {
+                runCatching { sampleSession(now) }
+                    .onFailure { L.w(TAG, "capture failed", it) }
+            }
             return chain.proceed()
         }
     }
 
-    /** Capture changed fields and detach once the required credentials exist. */
+    /** Serialize sampling with the fresh authority read and persistence. */
     @Synchronized
-    private fun capture(viewerContext: Any?) {
-        if (viewerContext == null || captureState.completed) return
-        captureState.capture(AccountCaptureState.Snapshot(
-            token = stringField(viewerContext, "mAuthToken"),
-            userId = stringField(viewerContext, "mUserId"),
-            username = stringField(viewerContext, "mUsername"),
-            cookies = stringField(viewerContext, "mSessionCookiesString"),
-        ))
+    private fun sampleSession(now: Long) {
+        if (!this::prefs.isInitialized) return
+        if (lastSample?.let { now - it < SAMPLE_INTERVAL_MS } == true) return
+        lastSample = now
+        refreshSession()
     }
 
-    /**
-     * The captured Graph user token, for repost/page calls — in-memory static
-     * first, pref fallback (mod: pO4TjBxQp2IFO1UyrtSF.oA72A8FsG9IKF8BK7Lb,
-     * libnc.so.c 1319475–1319736 — static GhTa.UuCRUjLnvPR7SP3GNGo, then the
-     * FBTOKEN pref). Blank/null = "no token" to callers.
-     */
-    fun authToken(): String? =
-        captureState.authToken?.takeIf { it.isNotBlank() }
-            ?: if (this::prefs.isInitialized) {
-                runCatching { prefs.getString(KEY_AUTH_TOKEN, "") }.getOrNull()
-                    ?.takeIf { it.isNotBlank() }
-            } else null
+    private fun refreshSession(): Boolean {
+        if (!this::prefs.isInitialized) return false
+        val current = sessionSource.read()
+        captureState.capture(current.snapshot, current.session)
+        return current.session is AccountCaptureState.Session.SignedIn
+    }
+
+    /** Recheck authority at use time; never fall back to unverified prefs. */
+    @Synchronized
+    fun authToken(): String? = if (refreshSession()) captureState.authToken else null
+
+    /** Downloads must also stop using cached cookies after logout. */
+    @Synchronized
+    fun httpCookie(): String? = if (refreshSession()) {
+        prefs.getString(KEY_COOKIE_HTTP, null)?.takeIf { it.isNotBlank() }
+    } else null
 
     /**
      * S7VA.XS11PXyJIvbyHBPk0TZ(JSONArray) port (libnc.so.c 684239–684517):
@@ -195,11 +253,6 @@ object AccountHook {
             sb.append(c.getString("name")).append('=').append(c.getString("value"))
         }
         sb.toString().takeIf { it.isNotEmpty() }
-    }.getOrNull()
-
-    private fun stringField(obj: Any, name: String): String? = runCatching {
-        val f = fields[name] ?: return@runCatching null
-        (f.get(obj) as? String)
     }.getOrNull()
 
 }

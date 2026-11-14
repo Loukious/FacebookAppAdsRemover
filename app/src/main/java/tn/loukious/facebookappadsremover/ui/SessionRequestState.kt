@@ -1,15 +1,31 @@
 package tn.loukious.facebookappadsremover.ui
 
-/** Outstanding session requests; consuming one reply leaves every other request pending. */
-internal class SessionRequestState(initial: Set<String> = emptySet()) {
-    private val pending = initial.toMutableSet()
+internal enum class SessionRequestKind {
+    LEGACY, EXPORT, IMPORT, DIAGNOSTICS_SAVE, DIAGNOSTICS_SHARE;
 
-    fun register(nonce: String) {
+    val isDiagnostics: Boolean
+        get() = this == DIAGNOSTICS_SAVE || this == DIAGNOSTICS_SHARE
+
+    fun requiresRestart(ok: Boolean): Boolean = this == IMPORT && ok
+}
+
+/** Outstanding requests retain their purpose across process recreation. */
+internal class SessionRequestState(
+    initial: Set<String> = emptySet(),
+    kinds: Map<String, SessionRequestKind> = emptyMap(),
+) {
+    private val pending = initial.associateWith { kinds[it] ?: SessionRequestKind.LEGACY }.toMutableMap()
+
+    fun register(nonce: String, kind: SessionRequestKind = SessionRequestKind.LEGACY) {
         require(nonce.isNotBlank())
-        pending.add(nonce)
+        pending[nonce] = kind
     }
 
-    fun consume(nonce: String?): Boolean = nonce != null && pending.remove(nonce)
+    fun kindOf(nonce: String?): SessionRequestKind? = pending[nonce]
 
-    fun snapshot(): Set<String> = pending.toSet()
+    fun consume(nonce: String?): Boolean = nonce != null && pending.remove(nonce) != null
+
+    fun snapshot(): Set<String> = pending.keys.toSet()
+
+    fun kindsSnapshot(): Map<String, SessionRequestKind> = pending.toMap()
 }

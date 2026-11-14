@@ -6,11 +6,18 @@ import android.content.ContentValues
 import android.content.Context
 import android.content.Intent
 import android.content.IntentFilter
+import android.content.pm.PackageManager
 import android.net.Uri
+import android.os.Binder
 import android.os.Build
+import android.os.Handler
+import android.os.Looper
+import android.os.Parcel
+import android.os.SystemClock
 import android.provider.MediaStore
 import android.util.Base64
 import android.widget.Toast
+import androidx.core.content.pm.PackageInfoCompat
 import org.json.JSONObject
 import tn.loukious.facebookappadsremover.hooks.AccountHook
 import java.io.File
@@ -70,11 +77,11 @@ object SessionBackup {
     const val SENDER_PERMISSION = "tn.loukious.facebookappadsremover.permission.SESSION_BACKUP"
 
     /**
-     * Ask Facebook to quit so the module app can start it again with fresh
-     * settings (Apply changes). Same signature-permission gate as the
-     * session actions: only the module app can make Facebook exit.
+     * Ordered preparation returns an endpoint for each running Facebook
+     * process. The caller observes endpoint death before asking it to quit,
+     * then starts Facebook only after all acknowledged processes have exited.
      */
-    const val ACTION_RESTART = "tn.loukious.facebookappadsremover.action.RESTART"
+    const val ACTION_RESTART = FacebookRestartProtocol.ACTION_PREPARE
 
     /**
      * Diagnostics: collect this process's module log lines (an app may read
@@ -128,16 +135,55 @@ object SessionBackup {
                 ACTION_IMPORT -> run("fbar-session-import") { importLatest(app) }
                 ACTION_DIAGNOSTICS -> run("fbar-diagnostics") { sendReport(app) }
                 ACTION_RESTART -> {
-                    L.i(TAG, "restart requested by the module app")
-                    // Let the broadcast finish before the process goes away.
-                    android.os.Handler(android.os.Looper.getMainLooper()).postDelayed({
-                        android.os.Process.killProcess(android.os.Process.myPid())
-                    }, 200)
+                    // Preparation has no side effects: a delayed broadcast or
+                    // abandoned request must never kill a newly opened app.
+                    val deadline = intent.getLongExtra(FacebookRestartProtocol.EXTRA_DEADLINE, 0)
+                    val now = SystemClock.elapsedRealtime()
+                    if (!isOrderedBroadcast || nonce.isNullOrBlank() || deadline <= now ||
+                        deadline - now > FacebookRestartProtocol.TIMEOUT_MS) return
+                    val extras = getResultExtras(true)
+                    extras.putBinder(
+                        FacebookRestartProtocol.ENDPOINT_PREFIX + android.os.Process.myPid(),
+                        RestartEndpoint(app, nonce, deadline),
+                    )
+                    setResultExtras(extras)
                 }
                 ACTION_IMPORT_DATA -> run("fbar-session-import") {
                     importData(app, intent.getStringExtra(EXTRA_DATA))
                 }
             }
+        }
+    }
+
+    /** A per-request capability; only the signature-authorized caller can stop us. */
+    private class RestartEndpoint(
+        private val context: Context,
+        private val nonce: String,
+        private val deadline: Long,
+    ) : Binder() {
+        private var stopRequested = false
+
+        override fun onTransact(code: Int, data: Parcel, reply: Parcel?, flags: Int): Boolean {
+            if (code != FacebookRestartProtocol.TRANSACTION_STOP) {
+                return super.onTransact(code, data, reply, flags)
+            }
+            data.enforceInterface(FacebookRestartProtocol.DESCRIPTOR)
+            if (context.checkCallingPermission(SENDER_PERMISSION) != PackageManager.PERMISSION_GRANTED) {
+                throw SecurityException("Restart requires the module signature permission")
+            }
+            val requestedNonce = data.readString()
+            synchronized(this) {
+                if (requestedNonce != nonce || data.dataAvail() != 0 || stopRequested ||
+                    SystemClock.elapsedRealtime() >= deadline) return true
+                stopRequested = true
+            }
+            Handler(Looper.getMainLooper()).postDelayed({
+                if (SystemClock.elapsedRealtime() < deadline) {
+                    L.i(TAG, "confirmed restart requested by the module app")
+                    android.os.Process.killProcess(android.os.Process.myPid())
+                }
+            }, 200)
+            return true
         }
     }
 
@@ -353,8 +399,6 @@ object SessionBackup {
             }
     }.getOrNull()
 
-    private val URL_PATTERN = Regex("""\b[a-zA-Z][a-zA-Z0-9+.-]*://([^/\s?#]+)\S*""")
-
     /** Report size cap: well under the ~1 MB binder transaction limit. */
     private const val REPORT_MAX_CHARS = 200_000
 
@@ -375,7 +419,7 @@ object SessionBackup {
     private fun buildReport(context: Context): String {
         val fb = runCatching {
             val info = context.packageManager.getPackageInfo(context.packageName, 0)
-            "${info.versionName} (${info.longVersionCode})"
+            "${info.versionName} (${PackageInfoCompat.getLongVersionCode(info)})"
         }.getOrDefault("?")
         val header = buildString {
             appendLine("Facebook $fb")
@@ -386,11 +430,9 @@ object SessionBackup {
         }
         val process = ProcessBuilder("logcat", "-d", "-v", "time").redirectErrorStream(true).start()
         val lines = process.inputStream.bufferedReader().useLines { seq ->
-            // Links (e.g. CleanUrl's unwrapped l.php targets) reveal what the
-            // user opened; the report is meant for public issues, so keep
-            // only the host.
-            seq.filter { "FBAR" in it || "FacebookAppAdsRemover" in it }
-                .map { line -> URL_PATTERN.replace(line) { "<link:${it.groupValues[1]}>" } }
+            // Export diagnostic records only; runtime media, account and
+            // activity payloads can disclose viewing or posting history.
+            seq.mapNotNull(DiagnosticsReportSanitizer::sanitizeLine)
                 .toList()
         }
         process.waitFor()

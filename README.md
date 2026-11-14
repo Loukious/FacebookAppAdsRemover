@@ -2,9 +2,9 @@
 
 An LSPosed/Xposed module for `com.facebook.katana` that removes ads using structural DexKit discovery plus guarded, version-specific fast paths.
 
-Original port target: Facebook `576.0.0.42.73`; development/device testing also covers `580.0.0.51.74` and `587.0.0.39.55`. Module `1.25` (versionCode 26). Discovery is primarily structural rather than based on hardcoded obfuscated class names, but an individual hook can still need revision after a Facebook update. Older versions (571 and below) are no longer supported.
+Original port target: Facebook `576.0.0.42.73`; development/device testing also covers `580.0.0.51.74` and `587.0.0.39.55`. Module `1.26` (versionCode 27). Discovery is primarily structural rather than based on hardcoded obfuscated class names, but an individual hook can still need revision after a Facebook update. Older versions (571 and below) are no longer supported.
 
-Version 1.25 restores contextual story/reel actions and rewarded-game completion on Facebook 587, and prevents repeated AMOLED hook registration. The older supported hook layouts remain available; this update does not require users to update Facebook. Existing settings are retained, while discovery caches refresh for the new module version.
+Version 1.26 updates account capture to follow the current login session and introduces section-based settings, Apply changes, and sanitized diagnostic reports. Existing settings are retained, while discovery caches refresh for the new module version.
 
 ## Features
 
@@ -16,7 +16,7 @@ Everything below is available from the module's settings app. The defaults shown
    - **Block Reels ads** *(ON)* — blocks dedicated Reels/Shorts ads and banners.
    - **Block Marketplace ads** *(ON)* — removes sponsored tiles, boosted listings and Marketplace video ads.
    - **Block game ads** *(ON)* — rejects interstitial, rewarded and banner ad requests in Facebook games; rewarded requests still resolve successfully so supported games can grant the reward.
-   - **Enable CSR feed ad guard** *(ON)* — adds extra News Feed cache/render protection for sponsored content.
+   - **Extra feed protection** *(ON)* — adds extra News Feed cache/render protection for sponsored content.
 
 2. **Feed filters**
    - **Hide Threads posts** — removes Threads promotion stories from the feed.
@@ -44,15 +44,15 @@ Everything below is available from the module's settings app. The defaults shown
    - **Hide Reels tab** — removes only the Reels button from Facebook's tab bar.
    - **Hide Marketplace tab** — removes only the Marketplace tab button.
    - **Hide Games tab** — removes only the Games/Gaming tab button.
-   - **Activity list (Intent dump)** — logs activities Facebook starts, including action, URI and extras.
+   - **Log opened screens (for developers)** — logs activities Facebook starts, including action, URI and extras.
 
 7. **Links**
    - **Open links in external browser** *(ON by default)* — opens outbound web links in your default browser; Facebook pages and login flows stay in the app.
-   - **Unwrap `l.php` redirect links** — rewrites Facebook tracking/redirect URLs to the real destination before opening them.
+   - **Remove link tracking** — rewrites Facebook tracking/redirect URLs to the real destination before opening them.
 
 8. **Downloader & Repost**
    - **Download via browser** *(ON by default)* — hands media URLs to your browser instead of the built-in downloader.
-   - **Show contextual download actions** *(ON)* — adds media-bound download/save actions for the Reel or Story currently open.
+   - **Show download buttons** *(ON)* — adds media-bound download/save actions for the Reel or Story currently open.
    - **Quick download from copied link** — copying an HTTP(S) link opens the quality-fetch / quick-download flow.
    - **Repost Reels** — adds a native **Repost** action to the active Reel so it can be reposted through the module's Facebook Page posting flow.
    - **Repost Stories** — adds **Repost** to the currently open Story's three-dot menu, bound to that Story's media.
@@ -62,7 +62,7 @@ Everything below is available from the module's settings app. The defaults shown
    - **Background playback** — keeps the tracked video playing while Facebook is backgrounded, without a floating window.
 
 10. **Account**
-    - **Export session** — exports Facebook authentication/session data and captured cookies.
+    - **Export session** — exports Facebook's authentication and login-session files.
     - **Import latest** — restores the newest exported session.
     - **Import from file** — restores a session backup selected from storage.
 
@@ -137,23 +137,31 @@ Optional video resume (**OFF by default**) restores a saved position once when r
 
 ### Account and Module
 
-Session export/import and launcher-icon visibility are described below.
+Account capture reads token and user ID together from Facebook's current authentication store. Startup clears unverified captured values; confirmed logout clears credentials, and token/cookie access rechecks the current session rather than trusting old callbacks or saved preferences.
+
+Startup capture was observed on Facebook 587 on device. Account switching, token refresh, logout and store replacement have regression-test coverage, but those transitions have not been verified on device; the new authentication-store integration has not been verified against older Facebook APKs. Session export/import and launcher-icon visibility are described below.
 
 ## Settings App
 
-The module ships its own Android app: one scrolling screen of switches. Open it from the launcher icon, or from the Xposed/Vector module list (Modules → Facebook App Ads Remover → settings).
+The module ships its own Android app with a home/status screen, separate settings pages, Diagnostics and About. Open it from the launcher icon, or from the Xposed/Vector module list (Modules → Facebook App Ads Remover → settings).
 
-The settings Activity uses Material 3 DayNight and Android 12+ **Dynamic Color** (wallpaper-derived system palette). Its switches, buttons, dialogs and system bars follow the active light/dark scheme; older devices retain the built-in theme fallback. This applies only to the module settings Activity, not Facebook's own theme or the AMOLED hook.
+The settings Activity uses Jetpack Compose and Material 3 Expressive with Android 12+ **Dynamic Color** (wallpaper-derived system palette). It follows the active light/dark scheme; older devices use a built-in color fallback. This applies only to the module settings Activity, not Facebook's own theme or the AMOLED hook.
 
-**How a toggle reaches a hook.** The switches are not stored in the module app. They live in the framework's remote-preferences group `fbar_settings` (the LSPosed/Vector daemon database), which the module app writes through the libxposed *service* library and the hooks read inside the Facebook process through `XposedInterface.getRemotePreferences`. Plain `SharedPreferences` files in either app's storage are **not** part of that channel — the daemon never reads them. Until the service binds, the switches render with their defaults and stay disabled; the header line says so. Several hooks read their toggle once at install, so treat a change as **apply on next Facebook restart**.
+**How a toggle reaches a hook.** Feature switches live in the framework's remote-preferences group `fbar_settings` (the LSPosed/Vector daemon database), which the module app writes through the libxposed *service* library and the hooks read inside the Facebook process through `XposedInterface.getRemotePreferences`. Plain `SharedPreferences` files in either app's storage are **not** part of that channel — the daemon never reads them. Until the service binds, feature switches render with their defaults and stay disabled. Several hooks read their toggle once at install, so changes require a Facebook restart.
 
-Earlier builds kept toggles in a Facebook-process-local `fbar_prefs` file (written while verifying on device with root). The first time the settings app binds, it copies that file into the remote group if the group is still empty; after that the remote group wins.
+**Apply changes** appears on the home screen after changing a feature setting or successfully importing a session, and remains available after closing or recreating settings. It waits for participating Facebook processes to exit before reopening Facebook. If the restart cannot be confirmed, changes remain pending; open Facebook and retry, or force-stop it manually. Edits made during a restart remain pending for the next apply.
+
+Earlier settings builds wrote to local storage in the module app; those values migrate when the service binds if the remote group is empty. Hooks also retain the Facebook-process-local `fbar_prefs` fallback until the remote group has values.
+
+### Diagnostics
+
+Open Facebook before requesting a report. **Save report** and **Share report** collect sanitized configuration and hook-discovery diagnostics, excluding raw activity and media payloads. Pending requests and private cached reports survive settings recreation, including while the system save picker is open.
 
 ### Session export / import
 
-The **Account** section holds buttons rather than switches. *Export session* copies Facebook's two live session files (`authentication`, `logged_in`) plus the captured cookies to `Download/FacebookAppAdsRemover` as `FBAR-Session-*.json`. *Import latest* restores the newest export; *Import from file…* lets you browse to any of those JSON files, for instance one copied from another device. Force-stop Facebook afterwards.
+The **Account** section holds buttons rather than switches. *Export session* copies Facebook's live authentication/login-session files, including per-account login files and the signed-in-account registry, to `Download/FacebookAppAdsRemover` as `FBAR-Session-*.json`; separately captured tokens and cookies are not added. *Import latest* restores the newest export; *Import from file…* lets you browse to any of those JSON files, for instance one copied from another device. After a successful import, return home and tap **Apply changes**. Backups contain login credentials and should be kept private.
 
-The buttons broadcast into the Facebook process, where `core.SessionBackup` answers — that side holds the session files and the captured cookies.
+The buttons send signature-protected broadcasts into the Facebook process, where `core.SessionBackup` accesses the session files.
 
 ### Hiding the launcher icon
 
