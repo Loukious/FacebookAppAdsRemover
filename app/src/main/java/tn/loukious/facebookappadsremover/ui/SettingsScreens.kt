@@ -364,6 +364,17 @@ private fun DiagnosticsScreen(model: SettingsModel, back: () -> Unit) {
                     "Facebook must have been opened at least once.",
             )
         }
+        item("debug") {
+            RowGroup(DEBUG_TOGGLES.map<ToggleSpec, @Composable (androidx.compose.ui.graphics.Shape) -> Unit> { spec ->
+                { shape ->
+                    SwitchRow(
+                        shape, TOGGLE_ICONS[spec.key], spec.title, spec.subtitle,
+                        checked = model.isOn(spec), enabled = model.bound,
+                    ) { model.setOn(spec, it) }
+                }
+            })
+            Spacer(Modifier.height(8.dp))
+        }
         item("actions") {
             val busy = model.reportLoading
             RowGroup(listOf(

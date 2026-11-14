@@ -106,6 +106,16 @@ val SECTION_INFO: Map<String, SectionInfo> = mapOf(
     "Module" to SectionInfo(R.drawable.ic_apps, "Settings for this app itself."),
 )
 
+/** Developer switches, shown on the Diagnostics page rather than with features. */
+val DEBUG_TOGGLES: List<ToggleSpec> = listOf(
+    ToggleSpec(
+        Settings.NAVIGATION_ACTIVITY_LIST,
+        "Log opened screens",
+        "Writes each internal Facebook screen to the log, so it ends up in the report",
+        false,
+    ),
+)
+
 val TOGGLE_SECTIONS: List<ToggleSection> = listOf(
     ToggleSection("Ads", listOf(
         ToggleSpec(
@@ -214,12 +224,6 @@ val TOGGLE_SECTIONS: List<ToggleSection> = listOf(
             Settings.NAV_HIDE_GAMES_TAB,
             "Hide Games tab",
             "Remove the Gaming button from the tab bar. Still available from the menu",
-            false,
-        ),
-        ToggleSpec(
-            Settings.NAVIGATION_ACTIVITY_LIST,
-            "Log opened screens (for developers)",
-            "Writes each internal Facebook screen to the system log. Only needed when reporting a bug",
             false,
         ),
     )),
