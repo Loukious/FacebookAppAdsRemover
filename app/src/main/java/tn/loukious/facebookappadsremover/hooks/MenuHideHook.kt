@@ -22,6 +22,9 @@ import java.util.WeakHashMap
  * entries are collapsed and the remaining entries are moved into the slots in
  * reading order, so the grid/list has no holes. Runs on every layout pass, so
  * it survives re-renders and recycled hosts.
+ *
+ * This covers the tile-grid menu. The list-style menu is filtered earlier, in
+ * the server response: see [MenuResponseHook].
  */
 object MenuHideHook {
     private const val TAG = "FBAR.Menu"
@@ -73,15 +76,11 @@ object MenuHideHook {
     }
 
     private fun compact(host: ViewGroup) {
-        var hasEntry = false
-        for (i in 0 until host.childCount) {
-            val c = host.getChildAt(i)
-            if (c.isClickable && bmidOf(c) != null) { hasEntry = true; break }
-        }
+        val hasEntry = hasEntry(host, 0)
         if (!hasEntry) return
         // Each entry may be its own LithoView cell of a list/grid: reflow the container.
         val parent = host.parent as? ViewGroup
-        val root = if (parent != null && host.childCount == 1) parent else host
+        val root = if (parent != null && host.javaClass.name == "com.facebook.litho.LithoView") parent else host
         if (root.getTag(TAG_PENDING) == true) return
         root.setTag(TAG_PENDING, true)
         // After Litho finishes mounting (it re-lays children after onLayout).
@@ -89,6 +88,13 @@ object MenuHideHook {
             root.setTag(TAG_PENDING, null)
             runCatching { reflow(root) }.onFailure { L.w(TAG, "reflow failed", it) }
         }
+    }
+
+    private fun hasEntry(v: View, depth: Int): Boolean {
+        if (depth > 0 && v.isClickable && bmidOf(v) != null) return true
+        if (v !is ViewGroup || depth >= 3) return false
+        for (i in 0 until v.childCount) if (hasEntry(v.getChildAt(i), depth + 1)) return true
+        return false
     }
 
     private class Entry(val view: View, val cell: View, val id: Long, val x: Int, val y: Int)
