@@ -94,7 +94,11 @@ object MenuResponseHook {
     private fun filteredCopy(payload: Any?): Any? {
         val text = payload?.let { textField.get(it) } as? String ?: return null
         val hidden = { id: Long -> Settings.getBoolean(MenuHideHook.key(id), false) }
-        val out = BloksMenuFilter.filter(text, hidden)
+        val out = BloksMenuFilter.filter(text, BloksMenuFilter.Rules(
+            bookmark = hidden,
+            section = { key -> Settings.getBoolean(Settings.MENU_SECTION_PREFIX + key, false) },
+            expand = Settings.getBoolean(Settings.MENU_EXPAND, false),
+        ))
         if (out === text) {
             if (!warnedFormat && BloksMenuFilter.namesHidden(text, hidden)) {
                 warnedFormat = true

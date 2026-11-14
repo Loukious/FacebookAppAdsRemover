@@ -66,4 +66,38 @@ class BloksMenuFilterTest {
         assertEquals(true, BloksMenuFilter.namesHidden(text) { it == 11111L })
         assertEquals(false, BloksMenuFilter.namesHidden(text) { false })
     }
+
+    // A menu shaped like the real one: state table, sections with visibility scripts, "See more".
+    private fun vis(section: String) =
+        """"v":["1","\t(e1w (e2e 0 (dnt \"st01\")) (f6t (e25 0) \"$section\" false) (e2a (e25 1) \"gone\" \"visible\"))"]"""
+    private fun sectionOf(key: String, body: String) = """{"s":{" ":[$body],${vis(key)}}}"""
+    private val button =
+        """{"b":{" ":[{"l":{"t":[" ","\t(dkc (e2a (dnv \"more1\" 1) (fna \"x7\" \"see_less_label\") (fna \"x9\" \"see_more_label\")))"]}}]}}"""
+    private fun fullMenu(sections: String, moreInitial: String = "false") =
+        """{"ft":{"k1":"${script(11111)}","k2":"${script(22222)}","k3":"${script(33333)}"},""" +
+            """"data":[{"id":"st01","type":"gs","data":{"key":"PE_PLAZA_SECTIONS:is_hidden_map","mode":"d","initial":{}}},""" +
+            """{"id":"more1","type":"ls","data":{"initial":$moreInitial}}],"tree":{"t":{" ":[$sections]}}}"""
+    private val mainRows = """${row("k1", "One")},{"m":{" ":[${row("k2", "Two")}],"v":["1","\t(e2a (dnv \"more1\" 1) \"visible\" \"gone\")"]}}"""
+    private val main = sectionOf("all_blended", "$mainRows,$button")
+    private val help = sectionOf("help", row("k3", "Help centre"))
+    private val promo = sectionOf("upsell", """{"card":{"#":"Promo"}}""")
+
+    @Test fun cutsWholeSectionsByKey() {
+        val text = fullMenu("$main,$help,$promo")
+        val rules = { keys: Set<String> -> BloksMenuFilter.Rules(bookmark = { false }, section = { it in keys }) }
+        assertSame(text, BloksMenuFilter.filter(text, rules(emptySet())))
+        assertEquals(fullMenu("$main,$promo"), BloksMenuFilter.filter(text, rules(setOf("help"))))
+        assertEquals(fullMenu("$main"), BloksMenuFilter.filter(text, rules(setOf("help", "upsell"))))
+    }
+
+    @Test fun expandShowsEverythingAndDropsTheButton() {
+        val text = fullMenu("$main,$help")
+        val expanded = fullMenu("${sectionOf("all_blended", mainRows)},$help", moreInitial = "true")
+        assertEquals(expanded, BloksMenuFilter.filter(text, BloksMenuFilter.Rules(bookmark = { false }, expand = true)))
+    }
+
+    @Test fun buttonStaysWhenItsStateIsNotFound() {
+        val text = fullMenu("$main,$help").replace("\"type\":\"ls\"", "\"type\":\"zz\"")
+        assertSame(text, BloksMenuFilter.filter(text, BloksMenuFilter.Rules(bookmark = { false }, expand = true)))
+    }
 }

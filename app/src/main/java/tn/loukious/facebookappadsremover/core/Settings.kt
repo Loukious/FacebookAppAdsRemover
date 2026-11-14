@@ -131,6 +131,10 @@ object Settings {
     const val NAV_HIDE_GAMES_TAB = "navigation.hideGamesTab"
     /** Side-menu entry hiding: key = prefix + Facebook bookmark id. */
     const val MENU_HIDE_PREFIX = "menu.hide."
+    /** Side-menu section hiding (list-style menu): key = prefix + Facebook's section key. */
+    const val MENU_SECTION_PREFIX = "menu.section."
+    /** Show every menu entry at once and drop the "See more" button (list-style menu). */
+    const val MENU_EXPAND = "menu.expand"
 
     /** Opt-in video resume — restore a saved point ONCE when a video opens,
      *  never force an already-playing video back after the user seeks. The
