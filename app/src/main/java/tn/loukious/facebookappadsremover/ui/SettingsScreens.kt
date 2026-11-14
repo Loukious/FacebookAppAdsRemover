@@ -135,7 +135,9 @@ fun SettingsApp(model: SettingsModel) {
     ) { mutableStateListOf<Screen>(Screen.Home) }
     // Home's scroll position survives a visit to a section page.
     val homeList = rememberLazyListState()
-    BackHandler(enabled = stack.size > 1) { stack.removeAt(stack.lastIndex) }
+    BackHandler(enabled = stack.size > 1) {
+        if (stack.size > 1) stack.removeAt(stack.lastIndex)
+    }
 
     val slide = with(LocalDensity.current) { 24.dp.roundToPx() }
     val spatial = MaterialTheme.motionScheme.defaultSpatialSpec<IntOffset>()
@@ -152,7 +154,10 @@ fun SettingsApp(model: SettingsModel) {
         },
         label = "screen",
     ) { screen ->
-        val back: (() -> Unit)? = if (screen == Screen.Home) null else ({ stack.removeAt(stack.lastIndex) })
+        val back: (() -> Unit)? = if (screen == Screen.Home) null else ({
+            // AnimatedContent keeps the outgoing page clickable during exit.
+            if (stack.size > 1 && stack.last() == screen) stack.removeAt(stack.lastIndex)
+        })
         when (screen) {
             Screen.Home -> HomeScreen(model, homeList) { stack.add(it) }
             is Screen.Section -> SectionScreen(model, screen.title, back!!)
