@@ -6,11 +6,18 @@ import android.content.ContentValues
 import android.content.Context
 import android.content.Intent
 import android.content.IntentFilter
+import android.content.pm.PackageManager
 import android.net.Uri
+import android.os.Binder
 import android.os.Build
+import android.os.Handler
+import android.os.Looper
+import android.os.Parcel
+import android.os.SystemClock
 import android.provider.MediaStore
 import android.util.Base64
 import android.widget.Toast
+import androidx.core.content.pm.PackageInfoCompat
 import org.json.JSONObject
 import tn.loukious.facebookappadsremover.hooks.AccountHook
 import java.io.File
@@ -70,6 +77,22 @@ object SessionBackup {
     const val SENDER_PERMISSION = "tn.loukious.facebookappadsremover.permission.SESSION_BACKUP"
 
     /**
+     * Ordered preparation returns an endpoint for each running Facebook
+     * process. The caller observes endpoint death before asking it to quit,
+     * then starts Facebook only after all acknowledged processes have exited.
+     */
+    const val ACTION_RESTART = FacebookRestartProtocol.ACTION_PREPARE
+
+    /**
+     * Diagnostics: collect this process's module log lines (an app may read
+     * its own uid's logcat without READ_LOGS) and send them back in
+     * [ACTION_RESULT] as [EXTRA_REPORT], so the settings screen can show the
+     * hook-discovery report without a computer.
+     */
+    const val ACTION_DIAGNOSTICS = "tn.loukious.facebookappadsremover.action.DIAGNOSTICS"
+    const val EXTRA_REPORT = "report"
+
+    /**
      * Result action sent back to the module app (foreground while the buttons
      * are pressed, so its toasts actually display — FB is backgrounded and
      * Android 11+ suppresses background toasts).
@@ -110,10 +133,57 @@ object SessionBackup {
             when (intent.action) {
                 ACTION_EXPORT -> run("fbar-session-export") { exportSession(app) }
                 ACTION_IMPORT -> run("fbar-session-import") { importLatest(app) }
+                ACTION_DIAGNOSTICS -> run("fbar-diagnostics") { sendReport(app) }
+                ACTION_RESTART -> {
+                    // Preparation has no side effects: a delayed broadcast or
+                    // abandoned request must never kill a newly opened app.
+                    val deadline = intent.getLongExtra(FacebookRestartProtocol.EXTRA_DEADLINE, 0)
+                    val now = SystemClock.elapsedRealtime()
+                    if (!isOrderedBroadcast || nonce.isNullOrBlank() || deadline <= now ||
+                        deadline - now > FacebookRestartProtocol.TIMEOUT_MS) return
+                    val extras = getResultExtras(true)
+                    extras.putBinder(
+                        FacebookRestartProtocol.ENDPOINT_PREFIX + android.os.Process.myPid(),
+                        RestartEndpoint(app, nonce, deadline),
+                    )
+                    setResultExtras(extras)
+                }
                 ACTION_IMPORT_DATA -> run("fbar-session-import") {
                     importData(app, intent.getStringExtra(EXTRA_DATA))
                 }
             }
+        }
+    }
+
+    /** A per-request capability; only the signature-authorized caller can stop us. */
+    private class RestartEndpoint(
+        private val context: Context,
+        private val nonce: String,
+        private val deadline: Long,
+    ) : Binder() {
+        private var stopRequested = false
+
+        override fun onTransact(code: Int, data: Parcel, reply: Parcel?, flags: Int): Boolean {
+            if (code != FacebookRestartProtocol.TRANSACTION_STOP) {
+                return super.onTransact(code, data, reply, flags)
+            }
+            data.enforceInterface(FacebookRestartProtocol.DESCRIPTOR)
+            if (context.checkCallingPermission(SENDER_PERMISSION) != PackageManager.PERMISSION_GRANTED) {
+                throw SecurityException("Restart requires the module signature permission")
+            }
+            val requestedNonce = data.readString()
+            synchronized(this) {
+                if (requestedNonce != nonce || data.dataAvail() != 0 || stopRequested ||
+                    SystemClock.elapsedRealtime() >= deadline) return true
+                stopRequested = true
+            }
+            Handler(Looper.getMainLooper()).postDelayed({
+                if (SystemClock.elapsedRealtime() < deadline) {
+                    L.i(TAG, "confirmed restart requested by the module app")
+                    android.os.Process.killProcess(android.os.Process.myPid())
+                }
+            }, 200)
+            return true
         }
     }
 
@@ -124,6 +194,8 @@ object SessionBackup {
             val filter = IntentFilter(ACTION_EXPORT).apply {
                 addAction(ACTION_IMPORT)
                 addAction(ACTION_IMPORT_DATA)
+                addAction(ACTION_RESTART)
+                addAction(ACTION_DIAGNOSTICS)
             }
             // The receiver lives in Facebook's process and can read or overwrite
             // its session: only senders holding the module's signature
@@ -326,6 +398,51 @@ object SessionBackup {
                 Uri.withAppendedPath(MediaStore.Downloads.EXTERNAL_CONTENT_URI, id.toString())
             }
     }.getOrNull()
+
+    /** Report size cap: well under the ~1 MB binder transaction limit. */
+    private const val REPORT_MAX_CHARS = 200_000
+
+    private fun sendReport(context: Context) {
+        val report = runCatching { buildReport(context) }
+            .getOrElse { "Couldn't read the log: ${it.message}" }
+        runCatching {
+            context.sendBroadcast(
+                Intent(ACTION_RESULT)
+                    .setPackage("tn.loukious.facebookappadsremover")
+                    .putExtra(EXTRA_OK, true)
+                    .putExtra(EXTRA_REPORT, report)
+                    .putExtra(EXTRA_NONCE, requestNonce.get()),
+            )
+        }.onFailure { L.w(TAG, "diagnostics reply failed", it) }
+    }
+
+    private fun buildReport(context: Context): String {
+        val fb = runCatching {
+            val info = context.packageManager.getPackageInfo(context.packageName, 0)
+            "${info.versionName} (${PackageInfoCompat.getLongVersionCode(info)})"
+        }.getOrDefault("?")
+        val header = buildString {
+            appendLine("Facebook $fb")
+            appendLine("Module ${tn.loukious.facebookappadsremover.BuildConfig.VERSION_NAME} " +
+                "(${tn.loukious.facebookappadsremover.BuildConfig.VERSION_CODE})")
+            appendLine("Android ${Build.VERSION.RELEASE} (API ${Build.VERSION.SDK_INT}), ${Build.MANUFACTURER} ${Build.MODEL}")
+            appendLine()
+        }
+        val process = ProcessBuilder("logcat", "-d", "-v", "time").redirectErrorStream(true).start()
+        val lines = process.inputStream.bufferedReader().useLines { seq ->
+            // Export diagnostic records only; runtime media, account and
+            // activity payloads can disclose viewing or posting history.
+            seq.mapNotNull(DiagnosticsReportSanitizer::sanitizeLine)
+                .toList()
+        }
+        process.waitFor()
+        val body = if (lines.isEmpty()) {
+            "No module log lines yet. Open Facebook for a few seconds, then try again."
+        } else {
+            lines.joinToString("\n").takeLast(REPORT_MAX_CHARS)
+        }
+        return header + body
+    }
 
     /** FB-side toast (visible only when FB is foreground) + module-app result. */
     private fun toast(context: Context, ok: Boolean, message: String) {

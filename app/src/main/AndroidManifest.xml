@@ -9,6 +9,11 @@
         android:protectionLevel="signature" />
     <uses-permission android:name="tn.loukious.facebookappadsremover.permission.SESSION_BACKUP" />
 
+    <!-- Apply changes relaunches Facebook (package visibility, API 30+). -->
+    <queries>
+        <package android:name="com.facebook.katana" />
+    </queries>
+
     <application
         android:allowBackup="true"
         android:dataExtractionRules="@xml/data_extraction_rules"
@@ -81,5 +86,16 @@
                 <action android:name="tn.loukious.facebookappadsremover.action.SESSION_RESULT" />
             </intent-filter>
         </receiver>
+
+        <!-- Shares diagnostics reports as a file attachment. -->
+        <provider
+            android:name="androidx.core.content.FileProvider"
+            android:authorities="${applicationId}.reports"
+            android:exported="false"
+            android:grantUriPermissions="true">
+            <meta-data
+                android:name="android.support.FILE_PROVIDER_PATHS"
+                android:resource="@xml/report_paths" />
+        </provider>
     </application>
 </manifest>
