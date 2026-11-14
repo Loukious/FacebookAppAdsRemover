@@ -42,4 +42,28 @@ class BloksMenuFilterTest {
         val once = BloksMenuFilter.filter(menu(*all)) { it == 22222L }
         assertSame(once, BloksMenuFilter.filter(once) { it == 22222L })
     }
+
+    @Test fun truncatedOrUnbalancedTextIsLeftAlone() {
+        val text = menu(*all)
+        val truncated = text.dropLast(3)
+        assertSame(truncated, BloksMenuFilter.filter(truncated) { true })
+        val unbalanced = text.replaceFirst("[", "{")
+        assertSame(unbalanced, BloksMenuFilter.filter(unbalanced) { true })
+    }
+
+    @Test fun onlyObjectsAreCut() {
+        // A bare string element that refers to a bookmark script is not a row.
+        val text = """{"ft":{"k1":"${script(11111)}","k2":"${script(22222)}"},"tree":["(dnk k1)",{"r":"(dnk k2)"}]}"""
+        assertEquals(
+            """{"ft":{"k1":"${script(11111)}","k2":"${script(22222)}"},"tree":["(dnk k1)"]}""",
+            BloksMenuFilter.filter(text) { true },
+        )
+    }
+
+    @Test fun reportsHiddenEntriesTheFormatNoLongerExposesAsRows() {
+        val text = """{"ft":{"k1":"${script(11111)}","k2":"${script(22222)}"},"tree":{"a":"(dnk k1)","b":"(dnk k2)"}}"""
+        assertSame(text, BloksMenuFilter.filter(text) { it == 11111L })
+        assertEquals(true, BloksMenuFilter.namesHidden(text) { it == 11111L })
+        assertEquals(false, BloksMenuFilter.namesHidden(text) { false })
+    }
 }

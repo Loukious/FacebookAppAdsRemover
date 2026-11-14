@@ -15,7 +15,7 @@ object BloksMenuFilter {
 
     /** Returns [text] without the rows of hidden bookmarks, or [text] itself when nothing changes. */
     fun filter(text: String, hidden: (Long) -> Boolean): String {
-        if (!text.contains("bmid")) return text
+        if (text.length > MAX_CHARS || !text.contains("bmid")) return text
         val scripts = scriptIds(text)
         if (scripts.isEmpty()) return text
         val all = scripts.values.toSet()
@@ -33,6 +33,16 @@ object BloksMenuFilter {
         out.append(text, pos, text.length)
         return out.toString()
     }
+
+    /**
+     * True when [text] names a hidden bookmark at all. If it does and [filter]
+     * still cut nothing, the response format has changed.
+     */
+    fun namesHidden(text: String, hidden: (Long) -> Boolean): Boolean =
+        text.length <= MAX_CHARS && text.contains("bmid") && scriptIds(text).values.any(hidden)
+
+    /** Menu responses are ~250k chars; anything huge is not worth scanning on the parser's thread. */
+    private const val MAX_CHARS = 4_000_000
 
     /** Script key -> bookmark id, for every `"key":"script"` pair whose script names one bookmark. */
     private fun scriptIds(text: String): Map<String, Long> {
@@ -83,7 +93,9 @@ object BloksMenuFilter {
         var i = 0
         fun endElement(f: Frame, end: Int) {
             if (end > f.elementStart) {
-                val cut = f.ids.size == 1 && hidden(f.ids.first())
+                // Rows are components, i.e. objects: never cut a bare string or number.
+                val isObject = text.substring(f.elementStart, end).trim().let { it.startsWith('{') && it.endsWith('}') }
+                val cut = isObject && f.ids.size == 1 && hidden(f.ids.first())
                 f.elements.add(intArrayOf(f.elementStart, end, if (cut) 1 else 0))
             }
         }
@@ -120,20 +132,20 @@ object BloksMenuFilter {
                     i++
                 }
                 ']', '}' -> {
-                    val f = stack.removeLastOrNull()
-                    if (f != null) {
-                        if (f.array) {
-                            endElement(f, i)
-                            addCuts(f.elements, out)
-                        }
-                        // The parent sees everything this container referred to.
-                        stack.lastOrNull()?.ids?.let { it.addAll(f.ids); it.addAll(f.done) }
+                    val f = stack.removeLastOrNull() ?: return emptyList() // not the JSON we know
+                    if (f.array != (text[i] == ']')) return emptyList()
+                    if (f.array) {
+                        endElement(f, i)
+                        addCuts(f.elements, out)
                     }
+                    // The parent sees everything this container referred to.
+                    stack.lastOrNull()?.ids?.let { it.addAll(f.ids); it.addAll(f.done) }
                     i++
                 }
                 else -> i++
             }
         }
+        if (stack.isNotEmpty()) return emptyList() // truncated text: leave it alone
         out.sortWith(compareBy({ it.first }, { -it.second }))
         return out
     }
