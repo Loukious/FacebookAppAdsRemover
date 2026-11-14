@@ -12,6 +12,7 @@ import tn.loukious.facebookappadsremover.core.SessionBackup
 import tn.loukious.facebookappadsremover.hooks.AccountHook
 import tn.loukious.facebookappadsremover.hooks.ActivityListHook
 import tn.loukious.facebookappadsremover.hooks.AdFilterHook
+import tn.loukious.facebookappadsremover.hooks.MenuHideHook
 import tn.loukious.facebookappadsremover.hooks.AdsOptOutHook
 import tn.loukious.facebookappadsremover.hooks.AmoledThemeHook
 import tn.loukious.facebookappadsremover.hooks.AutoRefreshHook
@@ -243,8 +244,7 @@ class ModuleMain : XposedModule() {
     private var darkActivityHookTried = false
     private var amoledResolversReady = false
     private var newsfeedUiFallbackReady = false
-    private var bloksProbeReady = false
-    private var bookmarkProbeReady = false
+    private var menuHideReady = false
     private var navigationTabNativeReady = false
     private var discoveryRan = false
 
@@ -270,20 +270,8 @@ class ModuleMain : XposedModule() {
         if (!navigationTabNativeReady) {
             navigationTabNativeReady = NavigationTabHook.installNative(this, classLoader)
         }
-        // RESEARCH ONLY (feature/menu-hiding): dump side-menu Bloks trees.
-        if (!bookmarkProbeReady) {
-            bookmarkProbeReady = tn.loukious.facebookappadsremover.hooks.BloksProbeHook.installBookmarkData(this, classLoader)
-            tn.loukious.facebookappadsremover.hooks.BloksProbeHook.startViewScan()
-        }
-        if (!bloksProbeReady) {
-            val app = runCatching {
-                Class.forName("android.app.ActivityThread").getMethod("currentApplication").invoke(null) as? Context
-            }.getOrNull()
-            if (app != null) {
-                bloksProbeReady = tn.loukious.facebookappadsremover.hooks.BloksProbeHook.install(
-                    this, classLoader, listOfNotNull(findSecondaryDexZip(app), app.applicationInfo.sourceDir).distinct(),
-                )
-            }
+        if (!menuHideReady) {
+            menuHideReady = MenuHideHook.install(this, classLoader)
         }
         // M4: video params capture — stable class name, needs only the
         // secondary dexes to attach (same cadence as the account hook).

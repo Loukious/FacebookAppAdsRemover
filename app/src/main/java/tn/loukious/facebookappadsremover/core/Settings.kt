@@ -129,6 +129,8 @@ object Settings {
     const val NAV_HIDE_REELS_TAB = "navigation.hideReelsTab"
     const val NAV_HIDE_MARKETPLACE_TAB = "navigation.hideMarketplaceTab"
     const val NAV_HIDE_GAMES_TAB = "navigation.hideGamesTab"
+    /** Side-menu entry hiding: key = prefix + Facebook bookmark id. */
+    const val MENU_HIDE_PREFIX = "menu.hide."
 
     /** Opt-in video resume — restore a saved point ONCE when a video opens,
      *  never force an already-playing video back after the user seeks. The
