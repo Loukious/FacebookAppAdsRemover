@@ -77,4 +77,5 @@ dependencies {
     implementation("org.jsoup:jsoup:1.17.2")
 
     testImplementation("junit:junit:4.13.2")
+    testImplementation("javax.inject:javax.inject:1")
 }
