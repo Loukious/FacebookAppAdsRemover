@@ -24,6 +24,10 @@ class SessionResultReceiver : BroadcastReceiver() {
         private const val KEY_PENDING_NONCES = "pending_nonces"
         private const val KEY_LEGACY_NONCE = "nonce"
 
+        /** Set by the open settings screen to receive diagnostics reports. */
+        @Volatile
+        var reportListener: ((String) -> Unit)? = null
+
         /**
          * The receiver must stay exported (Facebook's process sends the
          * result), so it only trusts replies carrying a pending request token.
@@ -71,12 +75,24 @@ class SessionResultReceiver : BroadcastReceiver() {
 
     override fun onReceive(context: Context, intent: Intent) {
         if (intent.action != SessionBackup.ACTION_RESULT) return
-        val message = intent.getStringExtra(SessionBackup.EXTRA_MESSAGE) ?: return
         val nonce = intent.getStringExtra(SessionBackup.EXTRA_NONCE)
+        val report = intent.getStringExtra(SessionBackup.EXTRA_REPORT)
+        val message = intent.getStringExtra(SessionBackup.EXTRA_MESSAGE)
+        if (report == null && message == null) return
         if (!consumeRequestNonce(context, nonce)) {
             android.util.Log.w("FBAR.Session", "ignoring session result without a matching request")
             return
         }
+        if (report != null) {
+            val listener = reportListener
+            if (listener != null) {
+                listener(report)
+            } else {
+                runCatching { Toast.makeText(context, "Diagnostics report received", Toast.LENGTH_SHORT).show() }
+            }
+            return
+        }
+        message ?: return
         val ok = intent.getBooleanExtra(SessionBackup.EXTRA_OK, false)
         runCatching {
             Toast.makeText(context, message, Toast.LENGTH_LONG).show()

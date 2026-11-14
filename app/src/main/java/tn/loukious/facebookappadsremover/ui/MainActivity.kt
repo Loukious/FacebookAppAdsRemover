@@ -2,26 +2,30 @@ package tn.loukious.facebookappadsremover.ui
 
 import android.content.Intent
 import android.content.SharedPreferences
+import android.graphics.BitmapFactory
+import android.net.Uri
 import android.os.Bundle
-import android.view.View
 import android.widget.Toast
-import android.view.Gravity
-import android.view.ViewGroup
-import android.widget.LinearLayout
-import android.widget.TextView
-import androidx.appcompat.app.AlertDialog
-import androidx.appcompat.app.AppCompatActivity
-import com.google.android.material.color.DynamicColors
-import com.google.android.material.materialswitch.MaterialSwitch
-import tn.loukious.facebookappadsremover.R
-import tn.loukious.facebookappadsremover.core.SessionBackup
-import tn.loukious.facebookappadsremover.core.Settings
-import tn.loukious.facebookappadsremover.core.AdSettingsMigration
+import androidx.activity.ComponentActivity
+import androidx.activity.compose.setContent
+import androidx.activity.enableEdgeToEdge
+import androidx.activity.result.contract.ActivityResultContracts
+import androidx.compose.runtime.getValue
+import androidx.compose.runtime.mutableStateMapOf
+import androidx.compose.runtime.mutableStateOf
+import androidx.compose.runtime.setValue
+import androidx.compose.ui.graphics.ImageBitmap
+import androidx.compose.ui.graphics.asImageBitmap
 import io.github.libxposed.service.XposedService
 import io.github.libxposed.service.XposedServiceHelper
+import tn.loukious.facebookappadsremover.core.AdSettingsMigration
+import tn.loukious.facebookappadsremover.core.SessionBackup
+import tn.loukious.facebookappadsremover.core.Settings
 
 /**
  * Settings screen — the toggle surface for every feature the module ports.
+ * The UI is Jetpack Compose (SettingsScreens.kt); this activity owns the
+ * state and the side effects behind it ([SettingsModel]).
  *
  * CHANNEL: toggles live in the framework's remote-preferences storage
  * (Vector/LSPosed daemon), reached from the module app through the libxposed
@@ -34,20 +38,39 @@ import io.github.libxposed.service.XposedServiceHelper
  * storage — credential-encrypted OR device-protected — are never read by the
  * daemon; writes must go through the service.
  *
- * Until the service binds, switches show disabled with defaults. The daemon
- * pushes change notifications to hooked processes, so toggles may apply
- * without an FB restart (documented as restart-required regardless).
- *
- * The in-FB floating panel the original mod had is a later milestone (M6)
- * and will read the same keys.
+ * Until the service binds, switches show disabled with defaults.
  */
-class MainActivity : AppCompatActivity() {
+class MainActivity : ComponentActivity(), SettingsModel {
 
     private var prefs: SharedPreferences? = null
-    private var serviceBound = false
-    private var resyncing = false
-    private lateinit var serviceHint: TextView
-    private lateinit var togglesList: LinearLayout
+
+    // ------------------------------------------------------------- state --
+
+    override var moduleState by mutableStateOf(ModuleState.CONNECTING)
+        private set
+    override var frameworkDetail by mutableStateOf<String?>(null)
+        private set
+    override var bound by mutableStateOf(false)
+        private set
+    /** Something changed since the last Apply: shows the Apply row. */
+    override var changed by mutableStateOf(false)
+        private set
+    override var keywords by mutableStateOf("")
+        private set
+    override var launcherVisible by mutableStateOf(true)
+        private set
+    override val contributors: List<Pair<Contributor, ImageBitmap?>> by lazy {
+        loadContributors(this).map { c ->
+            c to runCatching {
+                assets.open(c.avatar).use(BitmapFactory::decodeStream)?.asImageBitmap()
+            }.getOrNull()
+        }
+    }
+
+    private val values = mutableStateMapOf<String, Boolean>()
+
+    override var reportLoading by mutableStateOf(false)
+        private set
 
     /**
      * System file browser for importing a specific session export. The FB
@@ -55,78 +78,249 @@ class MainActivity : AppCompatActivity() {
      * picked JSON is read here (~15 KB) and shipped inside the broadcast.
      */
     private val pickSessionFile = registerForActivityResult(
-        androidx.activity.result.contract.ActivityResultContracts.OpenDocument()
+        ActivityResultContracts.OpenDocument(),
     ) { uri -> onSessionFilePicked(uri) }
 
     override fun onCreate(savedInstanceState: Bundle?) {
-        // Activity-only: never change Facebook's process/theme from the module.
-        // Apply BEFORE AppCompat inflates the ActionBar, views and dialogs.
-        // On Android < 12 or unsupported builds this is a no-op; the M3
-        // DayNight theme supplies its own accessible fallback colors.
-        DynamicColors.applyToActivityIfAvailable(this)
+        enableEdgeToEdge()
         super.onCreate(savedInstanceState)
-        setContentView(R.layout.activity_main)
-
-        serviceHint = TextView(this)
-        serviceHint.text = getString(R.string.service_waiting)
-        serviceHint.textSize = 13f
-        serviceHint.setPadding(0, 0, 0, 16)
-
-        togglesList = findViewById(R.id.toggles)
-        togglesList.addView(serviceHint)
-        for (section in TOGGLE_SECTIONS) {
-            addSectionHeader(togglesList, section.title)
-            for (toggle in section.toggles) {
-                addToggleRow(togglesList, toggle)
-            }
-            // Non-toggle controls that live inside their feature's section.
-            when (section.extra) {
-                SectionExtra.KEYWORDS -> addKeywordInput(togglesList)
-                SectionExtra.SESSION -> addSessionButtons(togglesList)
-                SectionExtra.LAUNCHER -> addLauncherIconRow(togglesList)
-                SectionExtra.NONE -> {}
+        launcherVisible = LauncherIcon.isVisible(this)
+        setContent { SettingsTheme { SettingsApp(this) } }
+        SessionResultReceiver.reportListener = { text ->
+            runOnUiThread {
+                reportLoading = false
+                onReport?.invoke(text)
+                onReport = null
             }
         }
+
+        // No bind within a few seconds: the framework doesn't know this
+        // module (not enabled in LSPosed/Vector), so say so instead of
+        // showing "connecting" forever.
+        window.decorView.postDelayed({ if (!bound) moduleState = ModuleState.INACTIVE }, 3000)
 
         XposedServiceHelper.registerListener(object : XposedServiceHelper.OnServiceListener {
             override fun onServiceBind(service: XposedService) {
                 prefs = runCatching { service.getRemotePreferences(Settings.NAME) }.getOrNull()
                 migrateFromLocalStorage()
                 migrateSplitAdToggles()
-                runOnUiThread { onServiceReady() }
+                val detail = runCatching {
+                    "${service.frameworkName} ${service.frameworkVersion} (API ${service.apiVersion})"
+                }.getOrNull()
+                runOnUiThread { onServiceReady(detail) }
             }
 
             override fun onServiceDied(service: XposedService) {
                 prefs = null
-                runOnUiThread { onServiceGone() }
+                runOnUiThread {
+                    bound = false
+                    moduleState = ModuleState.INACTIVE
+                }
             }
         })
     }
 
-    private fun onServiceReady() {
-        if (serviceBound) return
-        serviceBound = true
-        serviceHint.text = getString(R.string.service_ready)
-        // Re-sync every switch with the real stored state, then unlock them.
-        resyncing = true
+    private fun onServiceReady(detail: String?) {
+        if (bound) return
+        // Load the real stored state, then unlock the switches.
         for (spec in TOGGLE_SECTIONS.flatMap { it.toggles }) {
-            val switch = rows[spec.key] ?: continue
-            switch.isChecked = prefs?.getBoolean(spec.key, spec.default) ?: spec.default
-            switch.isEnabled = true
+            values[spec.key] = prefs?.getBoolean(spec.key, spec.default) ?: spec.default
         }
-        resyncing = false
-        keywordInput?.let { input ->
-            input.setText(prefs?.getString(Settings.FEED_KEYWORDS, "") ?: "")
-            input.isEnabled = true
-        }
+        keywords = prefs?.getString(Settings.FEED_KEYWORDS, "") ?: ""
+        frameworkDetail = detail
+        moduleState = ModuleState.ACTIVE
+        bound = true
     }
 
-    private fun onServiceGone() {
-        serviceBound = false
-        serviceHint.text = getString(R.string.service_waiting)
-        for (switch in rows.values) switch.isEnabled = false
-        keywordInput?.isEnabled = false
+    // ----------------------------------------------------------- actions --
+
+    override fun isOn(spec: ToggleSpec) = values[spec.key] ?: spec.default
+
+    override fun setOn(spec: ToggleSpec, on: Boolean) {
+        values[spec.key] = on
+        prefs?.edit()?.putBoolean(spec.key, on)?.apply()
+        changed = true
     }
+
+    /**
+     * The keyword list for the feed filter (Settings.FEED_KEYWORDS). Saved on
+     * every change: focus-loss saving proved fragile (a force-stop skips
+     * onPause entirely), which silently dropped typed keywords.
+     */
+    override fun updateKeywords(value: String) {
+        if (value == keywords) return
+        keywords = value
+        prefs?.edit()?.putString(Settings.FEED_KEYWORDS, value)?.apply()
+        changed = true
+    }
+
+    /**
+     * Launcher-icon switch (ui.LauncherIcon). Its value lives in
+     * PackageManager's component state rather than the framework's remote
+     * preferences, so it needs no service. Hiding is confirmed in the UI first.
+     */
+    override fun updateLauncherVisible(visible: Boolean) {
+        LauncherIcon.setVisible(this, visible)
+        launcherVisible = visible
+    }
+
+    /**
+     * One-tap apply: the module's receiver inside Facebook (SessionBackup,
+     * signature-protected) makes Facebook exit, then Facebook is started
+     * again here. If Facebook wasn't running, it simply starts.
+     */
+    override fun restartFacebook() {
+        val launch = packageManager.getLaunchIntentForPackage(FACEBOOK)
+        if (launch == null) {
+            Toast.makeText(this, "Facebook isn't installed", Toast.LENGTH_SHORT).show()
+            return
+        }
+        runCatching { sendBroadcast(Intent(SessionBackup.ACTION_RESTART).setPackage(FACEBOOK)) }
+        changed = false
+        Toast.makeText(this, "Restarting Facebook…", Toast.LENGTH_SHORT).show()
+        window.decorView.postDelayed({
+            launch.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK or Intent.FLAG_ACTIVITY_CLEAR_TASK)
+            runCatching { startActivity(launch) }
+        }, 1500)
+    }
+
+    /** What to do with the report once Facebook sends it. */
+    private var onReport: ((String) -> Unit)? = null
+    /** Increments per request so a stale timeout never cancels a newer one. */
+    private var reportRequest = 0
+    private var reportToSave: String? = null
+
+    private val createReportFile = registerForActivityResult(
+        ActivityResultContracts.CreateDocument("text/plain"),
+    ) { uri ->
+        val text = reportToSave
+        reportToSave = null
+        if (uri == null || text == null) return@registerForActivityResult
+        val ok = runCatching {
+            contentResolver.openOutputStream(uri)?.use { it.write(text.toByteArray()) } != null
+        }.getOrDefault(false)
+        Toast.makeText(this, if (ok) "Report saved" else "Couldn't save the report", Toast.LENGTH_SHORT).show()
+    }
+
+    private fun reportFileName(): String {
+        val stamp = java.text.SimpleDateFormat("yyyyMMdd-HHmmss", java.util.Locale.US).format(java.util.Date())
+        return "FBAR-diagnostics-$stamp.txt"
+    }
+
+    /**
+     * Ask Facebook for its module log (collected inside Facebook's process,
+     * no computer needed), then run [then] with it.
+     */
+    private fun fetchReport(then: (String) -> Unit) {
+        if (reportLoading) return
+        val nonce = SessionResultReceiver.newRequestNonce(this)
+        val intent = Intent(SessionBackup.ACTION_DIAGNOSTICS).setPackage(FACEBOOK)
+            .putExtra(SessionBackup.EXTRA_NONCE, nonce)
+        if (runCatching { sendBroadcast(intent) }.isFailure) {
+            SessionResultReceiver.cancelRequestNonce(this, nonce)
+            return
+        }
+        onReport = then
+        reportLoading = true
+        val request = ++reportRequest
+        // Facebook only answers while running; say so instead of spinning.
+        window.decorView.postDelayed({
+            if (reportLoading && request == reportRequest) {
+                reportLoading = false
+                onReport = null
+                SessionResultReceiver.cancelRequestNonce(this, nonce)
+                Toast.makeText(
+                    this,
+                    "Facebook didn't answer. Open Facebook once, then try again.",
+                    Toast.LENGTH_LONG,
+                ).show()
+            }
+        }, 6000)
+    }
+
+    override fun saveReport() = fetchReport { text ->
+        reportToSave = text
+        createReportFile.launch(reportFileName())
+    }
+
+    /** Shares the report as a .txt attachment (for an issue or a chat). */
+    override fun shareReport() = fetchReport { text ->
+        runCatching {
+            val dir = java.io.File(cacheDir, "reports").apply { mkdirs() }
+            dir.listFiles()?.forEach { it.delete() }
+            val file = java.io.File(dir, reportFileName()).apply { writeText(text) }
+            val uri = androidx.core.content.FileProvider.getUriForFile(this, "$packageName.reports", file)
+            val send = Intent(Intent.ACTION_SEND).setType("text/plain")
+                .putExtra(Intent.EXTRA_SUBJECT, "Facebook App Ads Remover diagnostics")
+                .putExtra(Intent.EXTRA_STREAM, uri)
+                .addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION)
+            startActivity(Intent.createChooser(send, "Share report"))
+        }.onFailure { Toast.makeText(this, "Couldn't share the report", Toast.LENGTH_SHORT).show() }
+    }
+
+    override fun onDestroy() {
+        SessionResultReceiver.reportListener = null
+        super.onDestroy()
+    }
+
+    override fun openUrl(url: String) {
+        runCatching { startActivity(Intent(Intent.ACTION_VIEW, Uri.parse(url))) }
+    }
+
+    /**
+     * Session export/import — broadcasts into the Facebook process
+     * (core.SessionBackup answers; it holds the session files and the
+     * captured cookies).
+     */
+    override fun sessionExport() = sendSession(SessionBackup.ACTION_EXPORT)
+
+    override fun sessionImportLatest() = sendSession(SessionBackup.ACTION_IMPORT)
+
+    override fun sessionImportFile() {
+        pickSessionFile.launch(arrayOf("application/json", "text/*", "*/*"))
+    }
+
+    private fun sendSession(action: String) {
+        val nonce = SessionResultReceiver.newRequestNonce(this)
+        val intent = Intent(action).setPackage(FACEBOOK).putExtra(SessionBackup.EXTRA_NONCE, nonce)
+        val sent = runCatching { sendBroadcast(intent) }.isSuccess
+        if (!sent) SessionResultReceiver.cancelRequestNonce(this, nonce)
+        Toast.makeText(
+            this,
+            if (sent) "Asking Facebook…" else "Broadcast failed — is Facebook installed?",
+            Toast.LENGTH_SHORT,
+        ).show()
+    }
+
+    private fun onSessionFilePicked(uri: Uri?) {
+        if (uri == null) return // picker cancelled
+        val text = runCatching {
+            contentResolver.openInputStream(uri)?.use { it.readBytes().decodeToString() }
+        }.getOrNull()
+        if (text.isNullOrBlank()) {
+            Toast.makeText(this, "Couldn't read the picked file", Toast.LENGTH_LONG).show()
+            return
+        }
+        // Quick client-side sanity check so obvious wrong files fail here
+        // rather than as a silent FB-side toast.
+        if (!text.trimStart().startsWith("{") || !text.contains("\"files\"")) {
+            Toast.makeText(this, "That doesn't look like a session export", Toast.LENGTH_LONG).show()
+            return
+        }
+        val nonce = SessionResultReceiver.newRequestNonce(this)
+        val intent = Intent(SessionBackup.ACTION_IMPORT_DATA)
+            .setPackage(FACEBOOK)
+            .putExtra(SessionBackup.EXTRA_DATA, text)
+            .putExtra(SessionBackup.EXTRA_NONCE, nonce)
+        runCatching { sendBroadcast(intent) }
+            .onSuccess { Toast.makeText(this, "Asking Facebook…", Toast.LENGTH_SHORT).show() }
+            .onFailure {
+                SessionResultReceiver.cancelRequestNonce(this, nonce)
+                Toast.makeText(this, "Broadcast failed — is Facebook installed?", Toast.LENGTH_SHORT).show()
+            }
+    }
+
+    // -------------------------------------------------------- migrations --
 
     /**
      * One-time carry-over from the plain-SharedPreferences writes of the first
@@ -178,240 +372,6 @@ class MainActivity : AppCompatActivity() {
             android.util.Log.w("FBAR.Settings", "Ad toggle migration failed", it)
         }
     }
-
-    private val rows = HashMap<String, MaterialSwitch>()
-    private var keywordInput: android.widget.EditText? = null
-
-    /**
-     * The keyword list for the feed filter (Settings.FEED_KEYWORDS). Saved on
-     * every text change; loaded once the service binds (same lifecycle as the
-     * switches).
-     */
-    private fun addKeywordInput(parent: ViewGroup) {
-        // Material text field: boxed outline with a floating hint, so the
-        // placeholder never overlaps the typed text (plain EditText inside
-        // this theme drew both on top of each other).
-        val layout = com.google.android.material.textfield.TextInputLayout(
-            this, null,
-            com.google.android.material.R.style.Widget_MaterialComponents_TextInputLayout_OutlinedBox,
-        ).apply {
-            hint = "e.g. giveaway, crypto, follow me on"
-            setPadding(dp(4), dp(12), dp(4), dp(4))
-        }
-
-        val input = com.google.android.material.textfield.TextInputEditText(layout.context)
-        input.setTextSize(android.util.TypedValue.COMPLEX_UNIT_SP, 15f)
-        input.setSingleLine(false)
-        input.minLines = 1
-        input.maxLines = 3
-        input.isEnabled = false // until the service binds
-        // Save on every change: focus-loss saving proved fragile (an EditText
-        // keeps focus when a non-focusable view is tapped, and a force-stop
-        // skips onPause entirely), which silently dropped typed keywords.
-        input.addTextChangedListener(object : android.text.TextWatcher {
-            override fun beforeTextChanged(s: CharSequence?, a: Int, b: Int, c: Int) {}
-            override fun onTextChanged(s: CharSequence?, a: Int, b: Int, c: Int) {}
-            override fun afterTextChanged(s: android.text.Editable?) {
-                saveKeywords(s?.toString() ?: "")
-            }
-        })
-        keywordInput = input
-        layout.addView(input)
-        parent.addView(layout)
-    }
-
-    private fun saveKeywords(value: String) {
-        prefs?.edit()?.putString(Settings.FEED_KEYWORDS, value)?.apply()
-    }
-
-    /**
-     * Session export/import — broadcasts into the Facebook process
-     * (core.SessionBackup answers; it holds the session files and the
-     * captured cookies).
-     */
-    private fun addSessionButtons(parent: ViewGroup) {
-        val row = LinearLayout(this)
-        row.orientation = LinearLayout.HORIZONTAL
-        row.setPadding(dp(4), dp(12), dp(4), dp(4))
-
-        val export = android.widget.Button(this)
-        export.text = "Export session"
-        export.setOnClickListener { sendSession(SessionBackup.ACTION_EXPORT) }
-        row.addView(export, LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f))
-
-        val spacer = View(this)
-        row.addView(spacer, LinearLayout.LayoutParams(dp(8), ViewGroup.LayoutParams.WRAP_CONTENT))
-
-        val import = android.widget.Button(this)
-        import.text = "Import latest"
-        import.setOnClickListener { sendSession(SessionBackup.ACTION_IMPORT) }
-        row.addView(import, LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f))
-
-        parent.addView(row)
-
-        val fromFile = android.widget.Button(this)
-        fromFile.text = "Import from file…"
-        fromFile.setOnClickListener { pickSessionFile.launch(arrayOf("application/json", "text/*", "*/*")) }
-        parent.addView(fromFile)
-
-        val caption = TextView(this)
-        caption.text = "Export copies the login (authentication/logged_in) files + cookies to Download/FacebookAppAdsRemover. \"Import latest\" restores the newest export; \"Import from file\" lets you browse to any FBAR-Session-*.json (e.g. one you copied to another folder or device). Force-stop Facebook afterwards."
-        caption.textSize = 13f
-        caption.setPadding(dp(4), 0, dp(4), dp(8))
-        parent.addView(caption)
-    }
-
-    private fun sendSession(action: String) {
-        val nonce = SessionResultReceiver.newRequestNonce(this)
-        val intent = Intent(action).setPackage("com.facebook.katana")
-            .putExtra(SessionBackup.EXTRA_NONCE, nonce)
-        val sent = runCatching { sendBroadcast(intent) }.isSuccess
-        if (!sent) SessionResultReceiver.cancelRequestNonce(this, nonce)
-        Toast.makeText(
-            this,
-            if (sent) "Asking Facebook…" else "Broadcast failed — is Facebook installed?",
-            Toast.LENGTH_SHORT,
-        ).show()
-    }
-
-    private fun onSessionFilePicked(uri: android.net.Uri?) {
-        if (uri == null) return // picker cancelled
-        val text = runCatching {
-            contentResolver.openInputStream(uri)?.use { it.readBytes().decodeToString() }
-        }.getOrNull()
-        if (text.isNullOrBlank()) {
-            Toast.makeText(this, "Couldn't read the picked file", Toast.LENGTH_LONG).show()
-            return
-        }
-        // Quick client-side sanity check so obvious wrong files fail here
-        // rather than as a silent FB-side toast.
-        if (!text.trimStart().startsWith("{") || !text.contains("\"files\"")) {
-            Toast.makeText(this, "That doesn't look like a session export", Toast.LENGTH_LONG).show()
-            return
-        }
-        val nonce = SessionResultReceiver.newRequestNonce(this)
-        val intent = Intent(SessionBackup.ACTION_IMPORT_DATA)
-            .setPackage("com.facebook.katana")
-            .putExtra(SessionBackup.EXTRA_DATA, text)
-            .putExtra(SessionBackup.EXTRA_NONCE, nonce)
-        runCatching { sendBroadcast(intent) }
-            .onSuccess { Toast.makeText(this, "Asking Facebook…", Toast.LENGTH_SHORT).show() }
-            .onFailure {
-                SessionResultReceiver.cancelRequestNonce(this, nonce)
-                Toast.makeText(this, "Broadcast failed — is Facebook installed?", Toast.LENGTH_SHORT).show()
-            }
-    }
-
-    private fun addSectionHeader(parent: ViewGroup, title: String) {
-        val tv = TextView(this)
-        tv.text = title
-        tv.textSize = 13f
-        tv.isAllCaps = true
-        tv.letterSpacing = 0.1f
-        tv.setPadding(dp(4), dp(24), dp(4), dp(8))
-        parent.addView(tv)
-    }
-
-    private fun addToggleRow(parent: ViewGroup, spec: ToggleSpec) {
-        val switch = buildToggleRow(parent, spec.title, spec.subtitle)
-        switch.isChecked = spec.default
-        switch.isEnabled = false // until the service binds
-        switch.setOnCheckedChangeListener { _, checked ->
-            if (resyncing) return@setOnCheckedChangeListener
-            prefs?.edit()?.putBoolean(spec.key, checked)?.apply()
-        }
-        rows[spec.key] = switch
-    }
-
-    /**
-     * The row layout every switch on this screen uses: title + subtitle on the
-     * left, switch on the right, whole row as the click target (the switch
-     * itself is a small target). Callers own the switch's initial state,
-     * enabled state and listener.
-     */
-    private fun buildToggleRow(parent: ViewGroup, title: String, subtitle: String): MaterialSwitch {
-        val row = LinearLayout(this)
-        row.orientation = LinearLayout.HORIZONTAL
-        row.gravity = Gravity.CENTER_VERTICAL
-        row.setPadding(dp(4), dp(10), dp(4), dp(10))
-
-        val text = LinearLayout(this)
-        text.orientation = LinearLayout.VERTICAL
-        text.layoutParams = LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f)
-
-        val titleView = TextView(this)
-        titleView.text = title
-        titleView.textSize = 16f
-        text.addView(titleView)
-
-        val subtitleView = TextView(this)
-        subtitleView.text = subtitle
-        subtitleView.textSize = 13f
-        subtitleView.setPadding(0, dp(2), 0, 0)
-        text.addView(subtitleView)
-        row.addView(text)
-
-        // MaterialSwitch reads Material 3 colorPrimary/onSurface, including
-        // Monet wallpaper colors after DynamicColors applies its overlay.
-        val switch = MaterialSwitch(this)
-        row.addView(switch)
-
-        // Whole row toggles, not just the small switch target.
-        row.setOnClickListener { if (switch.isEnabled) switch.toggle() }
-        parent.addView(row)
-        return switch
-    }
-
-    /**
-     * Launcher-icon switch (ui.LauncherIcon). The odd one out on this screen:
-     * its value lives in PackageManager's component state rather than the
-     * framework's remote preferences, so it needs no service and is enabled
-     * immediately instead of waiting for the bind.
-     *
-     * Hiding is confirmed first, because the icon is this app's only entry
-     * point — there is no second screen to fall back to.
-     */
-    private fun addLauncherIconRow(parent: ViewGroup) {
-        val switch = buildToggleRow(
-            parent,
-            "Show launcher icon",
-            "Hide this app's icon from the launcher. Everything keeps working — reopen this screen from the Xposed module list, or with the adb command shown before it's hidden",
-        )
-        switch.isChecked = LauncherIcon.isVisible(this)
-        switch.isEnabled = true
-
-        // Reverting from inside the listener re-enters it; this is the same
-        // guard the prefs switches use via `resyncing`.
-        var reverting = false
-        fun revert() {
-            reverting = true
-            switch.isChecked = true
-            reverting = false
-        }
-
-        switch.setOnCheckedChangeListener { _, checked ->
-            if (reverting) return@setOnCheckedChangeListener
-            if (checked) {
-                LauncherIcon.setVisible(this, true)
-                return@setOnCheckedChangeListener
-            }
-            AlertDialog.Builder(this)
-                .setTitle("Hide the launcher icon?")
-                .setMessage(
-                    "The icon disappears from your app drawer. Facebook keeps working, and so do its hooks.\n\n" +
-                        "To open this screen again:\n" +
-                        "•  Xposed/Vector → Modules → Facebook App Ads Remover → open settings\n" +
-                        "•  adb shell am start -n tn.loukious.facebookappadsremover/.ui.MainActivity"
-                )
-                // Both the button and a back/outside dismissal must put the
-                // switch back, or it would read "hidden" while the icon is
-                // still in the drawer.
-                .setNegativeButton("Cancel") { _, _ -> revert() }
-                .setOnCancelListener { revert() }
-                .setPositiveButton("Hide") { _, _ -> LauncherIcon.setVisible(this, false) }
-                .show()
-        }
-    }
-
-    private fun dp(v: Int): Int = (v * resources.displayMetrics.density + 0.5f).toInt()
 }
+
+private const val FACEBOOK = "com.facebook.katana"

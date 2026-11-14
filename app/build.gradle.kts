@@ -1,6 +1,7 @@
 plugins {
     id("com.android.application")
     id("org.jetbrains.kotlin.android")
+    id("org.jetbrains.kotlin.plugin.compose")
 }
 
 android {
@@ -30,16 +31,14 @@ android {
     // (VERSION_NAME + VERSION_CODE), so the generated BuildConfig is needed.
     buildFeatures {
         buildConfig = true
+        // Settings screen (ui/) is Jetpack Compose with Material 3 Expressive.
+        compose = true
     }
+    // Contributor snapshot for the About page (scripts/update_contributors.py).
+    sourceSets["main"].assets.srcDir("contributors")
     compileOptions {
         sourceCompatibility = JavaVersion.VERSION_21
         targetCompatibility = JavaVersion.VERSION_21
-    }
-    kotlinOptions {
-        jvmTarget = "21"
-        // libxposed:service is published with newer Kotlin metadata than our
-        // 1.9 compiler; we only call its simple public API.
-        freeCompilerArgs += "-Xskip-metadata-version-check"
     }
     packaging {
         resources {
@@ -48,12 +47,26 @@ android {
     }
 }
 
+kotlin {
+    compilerOptions {
+        jvmTarget.set(org.jetbrains.kotlin.gradle.dsl.JvmTarget.JVM_21)
+    }
+}
+
 base.archivesName.set("FacebookAppAdsRemover-v${android.defaultConfig.versionName}")
 
 dependencies {
     implementation("androidx.core:core-ktx:1.16.0")
-    implementation("androidx.appcompat:appcompat:1.6.1")
-    implementation("com.google.android.material:material:1.10.0")
+
+    // Settings UI: Compose + Material 3 Expressive (large flexible app bar,
+    // shape morphing, spring motion scheme).
+    implementation(platform("androidx.compose:compose-bom:2025.10.01"))
+    implementation("androidx.compose.ui:ui")
+    implementation("androidx.compose.foundation:foundation")
+    implementation("androidx.compose.animation:animation")
+    implementation("androidx.compose.material3:material3:1.5.0-alpha18")
+    implementation("androidx.graphics:graphics-shapes:1.0.1")
+    implementation("androidx.activity:activity-compose:1.11.0")
 
     // Modern Xposed API: compileOnly — provided by the framework in-process.
     compileOnly("io.github.libxposed:api:102.0.0")
