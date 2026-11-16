@@ -307,9 +307,23 @@ private fun SectionScreen(model: SettingsModel, title: String, back: () -> Unit)
         SECTION_INFO[title]?.intro?.let { intro ->
             item("intro") { Footnote(intro, Modifier.padding(bottom = 4.dp)) }
         }
+        // A page with sub-headings (Menu): one block of switches per heading, in declaration order.
+        for (group in section.toggles.mapNotNull { it.group }.distinct()) {
+            item("group:$group") {
+                SectionHeader(group)
+                RowGroup(section.toggles.filter { it.group == group }.map { spec ->
+                    { shape ->
+                        SwitchRow(
+                            shape, TOGGLE_ICONS[spec.key], spec.title, spec.subtitle,
+                            checked = model.isOn(spec), enabled = model.bound,
+                        ) { model.setOn(spec, it) }
+                    }
+                })
+            }
+        }
         item("rows") {
             val rows = ArrayList<@Composable (androidx.compose.ui.graphics.Shape) -> Unit>()
-            for (spec in section.toggles) {
+            for (spec in section.toggles.filter { it.group == null }) {
                 rows += { shape ->
                     SwitchRow(
                         shape, TOGGLE_ICONS[spec.key], spec.title, spec.subtitle,
