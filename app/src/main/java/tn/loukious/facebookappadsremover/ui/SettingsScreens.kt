@@ -68,6 +68,7 @@ import androidx.compose.ui.text.font.FontFamily
 import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.unit.IntOffset
 import androidx.compose.ui.unit.dp
+import tn.loukious.facebookappadsremover.core.Settings
 import tn.loukious.facebookappadsremover.BuildConfig
 import tn.loukious.facebookappadsremover.R
 
@@ -293,21 +294,27 @@ private fun SectionScreen(model: SettingsModel, title: String, back: () -> Unit)
                         checked = model.isOn(spec), enabled = model.bound,
                     ) { model.setOn(spec, it) }
                 }
-            }
-            when (section.extra) {
-                SectionExtra.KEYWORDS -> rows += { shape ->
-                    ContentRow(shape) {
-                        OutlinedTextField(
-                            value = model.keywords,
-                            onValueChange = model::updateKeywords,
-                            enabled = model.bound,
-                            label = { Text("Keywords") },
-                            placeholder = { Text("giveaway, crypto, follow me on") },
-                            maxLines = 3,
-                            modifier = Modifier.fillMaxWidth(),
-                        )
+                // The keyword list belongs to its switch: right under it, and only while it is on.
+                if (section.extra == SectionExtra.KEYWORDS &&
+                    spec.key == Settings.FEED_KEYWORDS_ENABLED && model.isOn(spec)
+                ) {
+                    rows += { shape ->
+                        ContentRow(shape) {
+                            OutlinedTextField(
+                                value = model.keywords,
+                                onValueChange = model::updateKeywords,
+                                enabled = model.bound,
+                                label = { Text("Keywords") },
+                                placeholder = { Text("giveaway, crypto, follow me on") },
+                                maxLines = 3,
+                                modifier = Modifier.fillMaxWidth(),
+                            )
+                        }
                     }
                 }
+            }
+            when (section.extra) {
+                SectionExtra.KEYWORDS -> {} // drawn with its switch above
                 SectionExtra.SESSION -> rows += { shape ->
                     ContentRow(shape) {
                         Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {

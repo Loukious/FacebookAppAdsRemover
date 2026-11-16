@@ -28,7 +28,7 @@ data class ToggleSpec(
 enum class SectionExtra {
     NONE,
 
-    /** Free-text keyword list for the feed filter. */
+    /** Free-text keyword list for the feed filter, shown under its switch while that is on. */
     KEYWORDS,
 
     /** Session export/import buttons. */
@@ -198,7 +198,7 @@ val TOGGLE_SECTIONS: List<ToggleSection> = listOf(
         ToggleSpec(
             Settings.FEED_KEYWORDS_ENABLED,
             "Keyword filter",
-            "Hide posts containing any word from the list below, separated by commas",
+            "Hide posts that contain any word or phrase from your list, separated by commas",
             false,
         ),
         ToggleSpec(
