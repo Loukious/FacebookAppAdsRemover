@@ -204,7 +204,7 @@ val TOGGLE_SECTIONS: List<ToggleSection> = listOf(
         ToggleSpec(
             Settings.FEED_AUTO_REFRESH_BLOCK,
             "Block auto-refresh",
-            "Stop the feed from jumping to the top and reloading when you return to the app (beta)",
+            "Stop the feed from jumping to the top and reloading when you return to the app",
             false,
         ),
     ), SectionExtra.KEYWORDS),
