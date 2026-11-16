@@ -28,6 +28,7 @@ import androidx.compose.foundation.layout.navigationBars
 import androidx.compose.foundation.layout.only
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.safeDrawing
+import androidx.compose.foundation.layout.windowInsetsPadding
 import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.lazy.LazyColumn
@@ -144,8 +145,10 @@ fun SettingsApp(model: SettingsModel) {
     val spatial = MaterialTheme.motionScheme.defaultSpatialSpec<IntOffset>()
     val effects = MaterialTheme.motionScheme.defaultEffectsSpec<Float>()
     var depth by remember { mutableStateOf(1) }
+    Column(Modifier.fillMaxSize()) {
     AnimatedContent(
         targetState = stack.last(),
+        modifier = Modifier.weight(1f),
         transitionSpec = {
             // Forward slides in from the right, back from the left.
             val sign = if (stack.size >= depth) 1 else -1
@@ -164,6 +167,40 @@ fun SettingsApp(model: SettingsModel) {
             is Screen.Section -> SectionScreen(model, screen.title, back!!)
             Screen.Diagnostics -> DiagnosticsScreen(model, back!!)
             Screen.About -> AboutScreen(model, back!!)
+        }
+    }
+    // One bar for every page where settings are edited, so it stays put
+    // while pages slide and is there the moment something changes.
+    val current = stack.last()
+    ApplyBar(visible = model.changed && (current == Screen.Home || current is Screen.Section), model::restartFacebook)
+    }
+}
+
+/** Pinned to the bottom while there are changes Facebook has not picked up yet. */
+@Composable
+private fun ApplyBar(visible: Boolean, restart: () -> Unit) {
+    AnimatedVisibility(
+        visible = visible,
+        enter = expandVertically(expandFrom = Alignment.Top) + fadeIn(),
+        exit = shrinkVertically(shrinkTowards = Alignment.Top) + fadeOut(),
+    ) {
+        Surface(color = MaterialTheme.colorScheme.surfaceContainerHigh, tonalElevation = 3.dp) {
+            Row(
+                Modifier
+                    .fillMaxWidth()
+                    .windowInsetsPadding(WindowInsets.safeDrawing.only(WindowInsetsSides.Horizontal + WindowInsetsSides.Bottom))
+                    .padding(horizontal = 16.dp, vertical = 12.dp),
+                verticalAlignment = Alignment.CenterVertically,
+                horizontalArrangement = Arrangement.spacedBy(12.dp),
+            ) {
+                Icon(painterResource(R.drawable.ic_restart), contentDescription = null)
+                Text(
+                    "Restart Facebook to apply changes",
+                    Modifier.weight(1f),
+                    style = MaterialTheme.typography.bodyLarge,
+                )
+                Button(onClick = restart) { Text("Restart") }
+            }
         }
     }
 }
@@ -223,21 +260,6 @@ private fun summaryFor(model: SettingsModel, section: ToggleSection): String {
 private fun HomeScreen(model: SettingsModel, list: LazyListState, open: (Screen) -> Unit) {
     SettingsScaffold("Ads Remover", onBack = null, listState = list) {
         item("status") { StatusCard(model.moduleState, model.frameworkDetail) }
-        item("apply") {
-            // Appears only once something changed since the last restart.
-            AnimatedVisibility(
-                visible = model.changed,
-                enter = expandVertically() + fadeIn(),
-                exit = shrinkVertically() + fadeOut(),
-            ) {
-                RowGroup(listOf { shape ->
-                    NavigationRow(
-                        shape, R.drawable.ic_restart, "Apply changes",
-                        "Restart Facebook so new settings take effect",
-                    ) { model.restartFacebook() }
-                }, Modifier.padding(top = 4.dp))
-            }
-        }
         val sections = TOGGLE_SECTIONS
         item("filters") {
             SectionHeader("Filters")
