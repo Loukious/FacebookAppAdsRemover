@@ -35,6 +35,7 @@ Everything below is available from the module's settings app. The defaults shown
 4. **Appearance**
    - **Force dark mode** — forces Facebook's dark theme.
    - **AMOLED black mode** — converts Facebook's dark neutral backgrounds to true black while preserving text, media and intentional colored surfaces.
+   - **Turn off HDR** — shows photos and videos without HDR, so the screen does not switch to its HDR mode (brightness jump, eye comfort mode off).
 
 5. **Privacy**
    - **Allow screenshots & recording** — clears `FLAG_SECURE` from Facebook activities.

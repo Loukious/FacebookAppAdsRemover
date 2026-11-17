@@ -107,6 +107,9 @@ object Settings {
      * turn its dark neutral background palette into true black. */
     const val APPEARANCE_AMOLED = "appearance.amoled"
 
+    /** Show HDR photos and videos as SDR, so the screen never switches to its HDR mode. */
+    const val APPEARANCE_NO_HDR = "appearance.noHdr"
+
     /** Clean URL — unwrap facebook.com/l.php?u=…&fbclid=… redirect links to
      *  the real destination when FB hands them to the browser (mod:
      *  swFbclid, X.O1EMPB7OWX4fymeZ5Qom). Default FALSE: the mod's
