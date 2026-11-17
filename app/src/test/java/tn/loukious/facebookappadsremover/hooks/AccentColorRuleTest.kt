@@ -33,7 +33,10 @@ class AccentColorRuleTest {
 
     @Test fun otherColoursAndReactionsStayAsTheyAre() {
         assertEquals(0xFFDD2334.toInt(), AccentColorRule.literal(0xFFDD2334.toInt(), palette))
+        // Like has a blue of its own in the dark theme...
         assertEquals(0xFF3E93F8.toInt(), AccentColorRule.resolver(0xFF3E93F8.toInt(), "REACTION_LIKE", palette))
+        // ...and is the accent blue itself in the light theme, where it cannot be told apart.
+        assertEquals(7, shade(AccentColorRule.resolver(0xFF0866FF.toInt(), "REACTION_LIKE", palette)))
         // Fully transparent: nothing to recolour.
         assertEquals(0x000866FF, AccentColorRule.literal(0x000866FF, palette))
     }
@@ -41,6 +44,26 @@ class AccentColorRuleTest {
     @Test fun literalBluesAreSwappedWithoutAToken() {
         assertEquals(7, shade(AccentColorRule.literal(0xFF0866FF.toInt(), palette)))
         assertEquals(7, shade(AccentColorRule.resolver(0xFF0866FF.toInt(), null, palette)))
+    }
+
+    @Test fun amoledRunsFirstAndLeavesTheAccentToThisRule() {
+        fun both(color: Int, token: String) =
+            AccentColorRule.resolver(AmoledColorRule.resolver(color, token), token, palette)
+        // A dark neutral background is blackened and then is no blue any more.
+        assertEquals(AmoledColorRule.BLACK, both(0xFF242526.toInt(), "SURFACE_BACKGROUND"))
+        // The unread tint is no background token: AMOLED passes it on, the accent takes it.
+        val tint = both(0x192D88FF, "NEW_NOTIFICATION_BACKGROUND")
+        assertEquals(0x19, tint ushr 24)
+        assertTrue(shade(tint) < AccentColorRule.TONES.size)
+        // The accent itself.
+        assertEquals(7, shade(both(0xFF0866FF.toInt(), "ACCENT")))
+    }
+
+    @Test fun onlyColoursThatWouldBeSwappedAreCandidates() {
+        assertTrue(AccentColorRule.isLiteral(0xFF0866FF.toInt()))
+        assertTrue(AccentColorRule.isLiteral(0x331D85FC))
+        assertFalse(AccentColorRule.isLiteral(0x000866FF))
+        assertFalse(AccentColorRule.isLiteral(0xFF242526.toInt()))
     }
 
     @Test fun withoutAPaletteNothingChanges() {

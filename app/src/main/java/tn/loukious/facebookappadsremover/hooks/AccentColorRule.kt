@@ -16,19 +16,21 @@ import kotlin.math.pow
  * - the literal blues measured in Facebook 588, which reach the screen past
  *   the scheme (resources, server-sent colour strings, paints).
  *
- * Reactions keep their colours, and nothing that is not blue is touched.
+ * Nothing that is not one of these blues is touched. Reactions have colours
+ * of their own and keep them, with one exception: in the light theme Like is
+ * drawn in the accent blue itself, so it follows the accent there.
  */
 internal object AccentColorRule {
 
     /** Tones of `system_accent1_0, _10, _50, _100 ... _900, _1000`, lightest first. */
     val TONES = intArrayOf(100, 99, 95, 90, 80, 70, 60, 50, 40, 30, 20, 10, 0)
 
+    /** The accent tokens Facebook 588 resolves to a blue, in either theme. */
     private val TOKENS = setOf(
         "ACCENT", "ACCENT_DEEMPHASIZED", "BLUE_LINK", "FB_WORDMARK", "STORY_UNSEEN",
-        "PRIMARY_BUTTON_BACKGROUND", "PRIMARY_BUTTON_PRESSED",
-        "PRIMARY_DEEMPHASIZED_BUTTON_BACKGROUND", "PRIMARY_DEEMPHASIZED_BUTTON_PRESSED",
+        "PRIMARY_BUTTON_BACKGROUND", "PRIMARY_DEEMPHASIZED_BUTTON_BACKGROUND",
         "PRIMARY_DEEMPHASIZED_BUTTON_ICON", "PRIMARY_DEEMPHASIZED_BUTTON_TEXT",
-        "NEW_NOTIFICATION_BACKGROUND", "TAB_BAR_ACTIVE_ICON", "HIGHLIGHT",
+        "NEW_NOTIFICATION_BACKGROUND",
     )
 
     /** Facebook 588's blues without alpha: accent, links, pressed states and their dark-theme pairs. */
@@ -47,9 +49,12 @@ internal object AccentColorRule {
     /** A colour that reached the screen past the scheme. */
     fun literal(color: Int, palette: IntArray?): Int = when {
         palette == null || palette.size != TONES.size -> color
-        (color and 0xFFFFFF) in LITERALS && (color ushr 24) != 0 -> swap(color, palette)
+        isLiteral(color) -> swap(color, palette)
         else -> color
     }
+
+    /** Whether [literal] would swap this colour: cheap enough to ask before fetching a palette. */
+    fun isLiteral(color: Int): Boolean = (color and 0xFFFFFF) in LITERALS && (color ushr 24) != 0
 
     private fun swap(color: Int, palette: IntArray): Int {
         val tone = lightness(color)

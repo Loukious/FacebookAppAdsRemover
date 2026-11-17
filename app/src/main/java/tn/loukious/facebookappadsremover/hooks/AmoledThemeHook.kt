@@ -82,14 +82,15 @@ object AmoledThemeHook {
     private const val LOADED = 2
     @Volatile private var accentState = NOT_LOADED
     @Volatile private var accentPalette: IntArray? = null
+    /** Its own lock: the object's monitor is held while hooks are installed. */
+    private val accentLock = Any()
 
     /**
      * Reading the shades goes through Resources.getColor, which is hooked
      * above and asks for the palette again: while it is being loaded that
      * inner call gets none, so the shades themselves come back unchanged.
      */
-    @Synchronized
-    private fun loadAccentPalette(): IntArray? {
+    private fun loadAccentPalette(): IntArray? = synchronized(accentLock) {
         if (accentState != NOT_LOADED) return accentPalette
         accentState = LOADING
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) accentPalette = runCatching {
@@ -106,13 +107,15 @@ object AmoledThemeHook {
         }.onFailure { L.w(TAG, "system accent palette unavailable", it) }.getOrNull()
         accentState = LOADED
         accentPalette?.let { L.i(TAG, "system accent palette: " + it.joinToString(" ") { c -> "#%06X".format(c and 0xFFFFFF) }) }
-        return accentPalette
+        accentPalette
     }
 
     /** AMOLED first, then the accent: a colour AMOLED blackened is no longer blue. */
     private fun literal(color: Int): Int {
         val c = if (enabled()) AmoledColorRule.untokened(color) else color
-        return AccentColorRule.literal(c, accent())
+        // Paints and resources ask this thousands of times a frame: only a colour that could be
+        // swapped is worth the look at the switch and the palette.
+        return if (AccentColorRule.isLiteral(c)) AccentColorRule.literal(c, accent()) else c
     }
 
     @Synchronized
@@ -406,7 +409,8 @@ object AmoledThemeHook {
                 .firstOrNull()
             if (!enabled()) return AccentColorRule.resolver(color, tokenName, accent())
             if (tokenName == NEW_NOTIFICATION_BACKGROUND) {
-                unreadNotificationColor = color
+                // The feed separator is drawn in this colour: it follows the accent with the rest.
+                unreadNotificationColor = AccentColorRule.resolver(color, tokenName, accent())
                 if (!loggedUnreadColor) {
                     loggedUnreadColor = true
                     L.i(TAG, "captured NEW_NOTIFICATION_BACKGROUND=#%08X".format(color))
