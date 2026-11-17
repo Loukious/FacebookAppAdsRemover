@@ -92,6 +92,27 @@ class BloksMenuFilterTest {
         assertEquals(fullMenu("$main"), BloksMenuFilter.filter(text, rules(setOf("help", "upsell"))))
     }
 
+    @Test(timeout = 10_000) fun largeMenuWithOrdinaryStringsStaysFastWhenNothingIsHidden() {
+        // A several-megabyte response remains below the parser's size limit.
+        // The generous timeout catches repeated scans of its remaining text;
+        // the hidden-sections state also exercises the component scanner.
+        val text = buildString {
+            append(fullMenu("$main,$help").dropLast(1))
+            repeat(65_000) { i ->
+                append(",\"field").append(i).append("\":\"ordinary_text_without_menu_markers\"")
+            }
+            append('}')
+        }
+        assertTrue("Fixture must stay below the parser's size limit", text.length < 4_000_000)
+        assertSame(text, BloksMenuFilter.filter(text) { false })
+    }
+
+    @Test fun unterminatedStringEndingWithEscapeIsLeftAlone() {
+        val text = fullMenu("$main,$help").dropLast(1) +
+            ",\"ordinary\":\"" + "x".repeat(32) + "\\"
+        assertSame(text, BloksMenuFilter.filter(text) { false })
+    }
+
     @Test fun expandShowsEverythingAndDropsTheButton() {
         val text = fullMenu("$main,$help")
         val expanded = fullMenu("${sectionOf("all_blended", mainRows)},$help", moreInitial = "true")

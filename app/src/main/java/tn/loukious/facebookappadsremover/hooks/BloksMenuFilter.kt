@@ -99,10 +99,10 @@ object BloksMenuFilter {
             val keyEnd = stringEnd(text, i)
             if (keyEnd + 2 < n && text[keyEnd + 1] == ':' && text[keyEnd + 2] == '"') {
                 val valueEnd = stringEnd(text, keyEnd + 2)
-                if (text.indexOf("bmid", keyEnd + 2).let { it in 0 until valueEnd } ||
-                    text.indexOf(ID_KEY, keyEnd + 2).let { it in 0 until valueEnd }
-                ) {
-                    val script = text.substring(keyEnd + 2, valueEnd)
+                // Search only this value: scanning the remaining response for every
+                // ordinary string makes menu parsing quadratic, even with no rules on.
+                val script = text.substring(keyEnd + 2, valueEnd)
+                if (script.contains("bmid") || script.contains(ID_KEY)) {
                     val ids = (BMID.findAll(script) + BOOKMARK_ID.findAll(script)).map { it.groupValues[1] }.toSet()
                     ids.singleOrNull()?.toLongOrNull()?.let { out[text.substring(i + 1, keyEnd)] = it }
                 }
@@ -219,12 +219,14 @@ object BloksMenuFilter {
                         }
                         j++
                     }
+                    if (j >= n) return emptyList() // Unterminated string: leave the response alone.
                     val top = stack.lastOrNull()
                     if (top != null && j - i > 20) {
-                        if (sectionsState != null && text.indexOf(sectionsState, i).let { it in 0 until j }) {
-                            sectionKey(text.substring(i, j), sectionsState)?.let { top.section = it }
+                        val script = text.substring(i, j)
+                        if (sectionsState != null && script.contains(sectionsState)) {
+                            sectionKey(script, sectionsState)?.let { top.section = it }
                         }
-                        if (cutMoreButton && text.indexOf(MORE_MARKER, i).let { it in 0 until j }) top.more = true
+                        if (cutMoreButton && script.contains(MORE_MARKER)) top.more = true
                     }
                     i = j + 1
                 }
