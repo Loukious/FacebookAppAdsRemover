@@ -26,7 +26,7 @@ Everything below is available from the module's settings app. The defaults shown
    - **Hide Stories in feed** — removes the Stories tray and its feed render.
    - **Hide AI-generated content** — filters stories Facebook marks as self-disclosed or Meta-detected AI content.
    - **Keyword filter** — hides feed stories containing any configured keyword, case-insensitively.
-   - **Block auto-refresh** *(Beta)* — blocks revisit, warm-start, foreground and forced News Feed refreshes.
+   - **Block auto-refresh** — blocks revisit, warm-start, foreground and forced News Feed refreshes.
 
 3. **Stories**
    - **View stories without marking seen** — blocks Facebook's seen-reporting controller.
@@ -35,6 +35,9 @@ Everything below is available from the module's settings app. The defaults shown
 4. **Appearance**
    - **Force dark mode** — forces Facebook's dark theme.
    - **AMOLED black mode** — converts Facebook's dark neutral backgrounds to true black while preserving text, media and intentional colored surfaces.
+   - **Turn off HDR** — keeps photos and videos at normal brightness where supported, reducing brightness jumps and preserving eye comfort mode.
+
+     Video uses decoder tone mapping or an SDR surface brightness limit where Android supports it. If both are unavailable, playback continues and Diagnostics reports that HDR may remain active. Actual HDR suppression still needs testing on an HDR-capable phone.
    - **Material You accent** — buttons, links and highlights take the system accent colour (Android 12+ dynamic colour) instead of Facebook blue.
 
 5. **Privacy**

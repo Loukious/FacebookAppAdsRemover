@@ -12,6 +12,8 @@ import tn.loukious.facebookappadsremover.core.SessionBackup
 import tn.loukious.facebookappadsremover.hooks.AccountHook
 import tn.loukious.facebookappadsremover.hooks.ActivityListHook
 import tn.loukious.facebookappadsremover.hooks.AdFilterHook
+import tn.loukious.facebookappadsremover.hooks.MenuHideHook
+import tn.loukious.facebookappadsremover.hooks.MenuResponseHook
 import tn.loukious.facebookappadsremover.hooks.AdsOptOutHook
 import tn.loukious.facebookappadsremover.hooks.AmoledThemeHook
 import tn.loukious.facebookappadsremover.hooks.AutoRefreshHook
@@ -23,6 +25,7 @@ import tn.loukious.facebookappadsremover.hooks.DownloadHook
 import tn.loukious.facebookappadsremover.hooks.DarkModeHook
 import tn.loukious.facebookappadsremover.hooks.FeedGuardHook
 import tn.loukious.facebookappadsremover.hooks.GameAdsHook
+import tn.loukious.facebookappadsremover.hooks.HdrHook
 import tn.loukious.facebookappadsremover.hooks.HideSeenStoryHook
 import tn.loukious.facebookappadsremover.hooks.MarketplaceAdsHook
 import tn.loukious.facebookappadsremover.hooks.NewsfeedFilterHook
@@ -159,6 +162,11 @@ class ModuleMain : XposedModule() {
         runCatching { AmoledThemeHook.installFramework(this) }
             .onFailure { L.e(TAG, "AMOLED framework hooks failed", it) }
 
+        // Platform methods only, and Facebook may ask about the screen once and keep the
+        // answer: these go in before any of its UI exists.
+        runCatching { HdrHook.install(this) }
+            .onFailure { L.e(TAG, "HDR hooks failed", it) }
+
         try {
             System.loadLibrary("dexkit")
         } catch (t: Throwable) {
@@ -249,6 +257,8 @@ class ModuleMain : XposedModule() {
     private var darkActivityHookTried = false
     private var amoledResolversReady = false
     private var newsfeedUiFallbackReady = false
+    private var menuHideReady = false
+    private var menuResponseReady = false
     private var navigationTabNativeReady = false
     private var discoveryRan = false
 
@@ -273,6 +283,12 @@ class ModuleMain : XposedModule() {
         }
         if (!navigationTabNativeReady) {
             navigationTabNativeReady = NavigationTabHook.installNative(this, classLoader)
+        }
+        if (!menuHideReady) {
+            menuHideReady = MenuHideHook.install(this, classLoader)
+        }
+        if (!menuResponseReady) {
+            menuResponseReady = MenuResponseHook.install(this, classLoader)
         }
         // M4: video params capture — stable class name, needs only the
         // secondary dexes to attach (same cadence as the account hook).
@@ -913,7 +929,7 @@ class ModuleMain : XposedModule() {
      * (the archive is regenerated lazily, sometimes never) and are ignored —
      * their class names no longer resolve in the current classloader.
      */
-    private fun findSecondaryDexZip(context: Context?): String? {
+    internal fun findSecondaryDexZip(context: Context?): String? {
         if (context == null) return null
         return runCatching {
             val installedAt = context.applicationInfo?.sourceDir

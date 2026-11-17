@@ -20,7 +20,10 @@ android {
 
     buildTypes {
         release {
-            isMinifyEnabled = false
+            // R8 shrinks only third-party UI libraries (Compose, AndroidX):
+            // proguard-rules.pro keeps all module code and hook libraries as is.
+            isMinifyEnabled = true
+            isShrinkResources = true
             proguardFiles(
                 getDefaultProguardFile("proguard-android-optimize.txt"),
                 "proguard-rules.pro"
@@ -91,4 +94,6 @@ dependencies {
 
     testImplementation("junit:junit:4.13.2")
     testImplementation("javax.inject:javax.inject:1")
+    testImplementation("io.github.libxposed:api:102.0.0")
+    testImplementation("org.mockito:mockito-core:5.18.0")
 }

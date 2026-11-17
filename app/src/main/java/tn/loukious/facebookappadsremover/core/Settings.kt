@@ -107,6 +107,9 @@ object Settings {
      * turn its dark neutral background palette into true black. */
     const val APPEARANCE_AMOLED = "appearance.amoled"
 
+    /** Show HDR photos and videos as SDR, so the screen never switches to its HDR mode. */
+    const val APPEARANCE_NO_HDR = "appearance.noHdr"
+
     /** Facebook's blue accent follows the system accent colour (Android 12+ dynamic colour). */
     const val APPEARANCE_ACCENT = "appearance.systemAccent"
 
@@ -132,6 +135,12 @@ object Settings {
     const val NAV_HIDE_REELS_TAB = "navigation.hideReelsTab"
     const val NAV_HIDE_MARKETPLACE_TAB = "navigation.hideMarketplaceTab"
     const val NAV_HIDE_GAMES_TAB = "navigation.hideGamesTab"
+    /** Side-menu entry hiding: key = prefix + Facebook bookmark id. */
+    const val MENU_HIDE_PREFIX = "menu.hide."
+    /** Side-menu section hiding (list-style menu): key = prefix + Facebook's section key. */
+    const val MENU_SECTION_PREFIX = "menu.section."
+    /** Show every menu entry at once and drop the "See more" button (list-style menu). */
+    const val MENU_EXPAND = "menu.expand"
 
     /** Opt-in video resume — restore a saved point ONCE when a video opens,
      *  never force an already-playing video back after the user seeks. The
