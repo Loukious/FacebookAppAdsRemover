@@ -1,6 +1,7 @@
 package tn.loukious.facebookappadsremover.hooks
 
 import android.graphics.Rect
+import android.os.SystemClock
 import android.view.View
 import android.view.ViewGroup
 import android.view.ViewTreeObserver
@@ -41,16 +42,26 @@ object MenuHideHook {
     private const val COMPONENT_TREE = "com.facebook.litho.ComponentTree"
     private const val RECYCLER_VIEW = "androidx.recyclerview.widget.RecyclerView"
     private const val SHORTCUTS = "shortcut"
+    private const val SEE_MORE = "see_more_test_key"
+    /** How long the list takes to show or drop the tiles after See more is pressed. */
+    private const val EXPAND_MS = 700L
+    /** How deep and how far the walk for the See more button goes. */
+    private const val DEEP = 13
+    private const val DEEP_BUDGET = 4000
     private val HOST_CLASSES = listOf("com.facebook.litho.ComponentHost", LITHO_VIEW)
     private val BMID = Regex("\"bmid\":(\\d+)")
 
-    /** What a clickable view of the menu is: a bookmark ([id] != 0) or the header of a [section]. */
-    private class Hit(val id: Long, val section: String?, val strong: Boolean) {
+    /**
+     * What a clickable view of the menu is: a bookmark ([id] != 0), the header
+     * of a [section] or the See more button ([more]).
+     */
+    private class Hit(val id: Long, val section: String?, val strong: Boolean, val more: Boolean = false) {
         val hidden: Boolean
             get() = (id != 0L && Settings.getBoolean(key(id), false)) ||
                 (section != null && Settings.getBoolean(Settings.MENU_SECTION_PREFIX + section, false))
     }
     private val NONE = Hit(0, null, false)
+    private val MORE = Hit(0, null, true, more = true)
 
     /** Section header test key -> section key, as in the list-style menu's response. */
     private val HEADERS = mapOf(
@@ -104,8 +115,8 @@ object MenuHideHook {
     private val cuts = Collections.synchronizedMap(WeakHashMap<Any, Cut>())
     private var treeFields: List<Field>? = null
 
-    /** Litho's tree of a tile -> how many hidden tiles precede it in its block. */
-    private val shifts = Collections.synchronizedMap(WeakHashMap<Any, Int>())
+    /** Litho's tree of a tile -> how far it is moved from where the list puts it. */
+    private val moves = Collections.synchronizedMap(WeakHashMap<Any, Pair<Int, Int>>())
     private val setMeasured: Method? by lazy {
         runCatching {
             View::class.java.getDeclaredMethod(
@@ -113,6 +124,9 @@ object MenuHideHook {
             ).apply { isAccessible = true }
         }.getOrNull()
     }
+
+    /** listener object -> whether the deeper walk found it to be the See more button. */
+    private val mores = Collections.synchronizedMap(WeakHashMap<Any, Boolean>())
 
     /** listener object -> what it is (or NONE). Keyed by listener, not view: Litho recycles hosts. */
     private val hits = Collections.synchronizedMap(WeakHashMap<Any, Hit>())
@@ -174,9 +188,16 @@ object MenuHideHook {
     private fun shorten(v: View) {
         val tree = treeOf(v) ?: return
         val cut = cuts[tree] ?: return
-        if (v.measuredHeight == cut.from) setMeasured?.invoke(v, v.measuredWidth, cut.to)
-        // The cell's content has changed since: it is looked at again after this layout.
-        else cuts.remove(tree)
+        when (v.measuredHeight) {
+            cut.from -> setMeasured?.invoke(v, v.measuredWidth, cut.to)
+            // The list asking for the very height it has given the cell changes nothing.
+            cut.to -> {}
+            // The cell's content has changed since: it is looked at again.
+            else -> {
+                cuts.remove(tree)
+                (v.parent as? ViewGroup)?.let { schedule(it) }
+            }
+        }
     }
 
     /** Litho's tree shown in [cell], found by its type: the field names are obfuscated. */
@@ -194,11 +215,24 @@ object MenuHideHook {
     private fun cut(cell: View, to: Int): Boolean {
         if (setMeasured == null) return false
         val tree = treeOf(cell) ?: return false
-        if (cuts[tree] == null && cell.height > to) {
+        val cut = cuts[tree]
+        if (cut == null && cell.height > to) {
             cuts[tree] = Cut(cell.height, to)
-            cell.requestLayout()
+            remeasure(cell)
+        } else if (cut != null && cell.height == cut.from && cut.from != cut.to) {
+            // Still as high as before: the request to measure it again got lost.
+            remeasure(cell)
         }
         return true
+    }
+
+    /**
+     * Has the list measure [cell] again. Not through the cell's own
+     * requestLayout: a Litho host drops that while it is being laid out.
+     */
+    private fun remeasure(cell: View) {
+        cell.forceLayout()
+        (cell.parent as? View)?.requestLayout()
     }
 
     private fun compact(host: ViewGroup) {
@@ -277,6 +311,7 @@ object MenuHideHook {
         if (all.none { it.hit.strong }) return
         watch(root)
         if (Settings.getBoolean(Settings.MENU_SECTION_PREFIX + SHORTCUTS, false)) cutShortcuts(root)
+        if (Settings.getBoolean(Settings.MENU_EXPAND, false)) expand(root, all)
         val freed = level(root, all, 0)
         // A list animates its rows with the same translation when a section opens or closes,
         // and finishes by resetting it: look again once that is over.
@@ -290,6 +325,65 @@ object MenuHideHook {
     }
 
     /**
+     * Shows all tiles: presses See more once, then takes the button out of the
+     * list. The button says nowhere which way it goes, so the tiles are counted
+     * before and after: if pressing it left fewer, the menu was open already
+     * and it is pressed again.
+     */
+    private fun expand(root: ViewGroup, all: List<Entry>) {
+        val button = all.firstOrNull { it.hit.more } ?: seeMore(root) ?: return
+        val tiles = all.count { it.hit.id != 0L && it.hit.section == null }
+        when (val state = root.getTag(TAG_MORE)) {
+            null -> press(root, button, Pressed(tiles, SystemClock.uptimeMillis(), false))
+            is Pressed -> when {
+                SystemClock.uptimeMillis() - state.at < EXPAND_MS -> {}
+                tiles < state.tiles && !state.again ->
+                    press(root, button, Pressed(tiles, SystemClock.uptimeMillis(), true))
+                else -> { root.setTag(TAG_MORE, true); cut(button.cell, 0) }
+            }
+            else -> cut(button.cell, 0)
+        }
+    }
+
+    /**
+     * The See more button among the full-width cells of [root]. Its test key
+     * lies deeper than the walk every clickable view gets, so the views that
+     * walk told nothing about are looked into further here, in a menu only.
+     */
+    private fun seeMore(root: ViewGroup): Entry? {
+        for (i in 0 until root.childCount) {
+            val cell = root.getChildAt(i)
+            if (cell.width * 2 <= root.width) continue
+            val view = seeMoreIn(cell, 0) ?: continue
+            return Entry(view, cell, MORE, cell.left, cell.top)
+        }
+        return null
+    }
+
+    private fun seeMoreIn(v: View, depth: Int): View? {
+        if (v.isClickable && hitOf(v) == null) {
+            val listener = listenerOf(v)
+            if (listener != null && mores.getOrPut(listener) {
+                    val found = Found()
+                    runCatching { find(listener, IdentityHashMap(), intArrayOf(600 - DEEP_BUDGET), 0, found, DEEP) }
+                    found.more
+                }) return v
+        }
+        if (v !is ViewGroup || depth > 4) return null
+        for (i in 0 until v.childCount) seeMoreIn(v.getChildAt(i), depth + 1)?.let { return it }
+        return null
+    }
+
+    /** See more has been pressed [at] this time with [tiles] tiles on screen; [again] for the second time. */
+    private class Pressed(val tiles: Int, val at: Long, val again: Boolean)
+
+    private fun press(root: ViewGroup, button: Entry, state: Pressed) {
+        root.setTag(TAG_MORE, state)
+        button.view.performClick()
+        root.postDelayed({ schedule(root) }, EXPAND_MS + 50)
+    }
+
+    /**
      * Your shortcuts is no cell of its own: it is the end of the first cell,
      * under the profile card, and the only thing there that scrolls sideways.
      * That cell is cut right after the last button above the block, keeping
@@ -300,7 +394,7 @@ object MenuHideHook {
             val cell = root.getChildAt(i) as? ViewGroup ?: continue
             if (cell.height <= 0 || cell.width * 2 <= root.width) continue
             val tree = treeOf(cell) ?: continue
-            if (cuts[tree] != null) continue
+            if (cuts[tree] != null) { cut(cell, cuts[tree]?.to ?: continue); continue }
             val list = IntArray(2)
             if (!findList(cell, 0, 0, list)) continue
             // Only a margin may follow the block: anything more would be cut off with it.
@@ -420,8 +514,8 @@ object MenuHideHook {
         val single = cells - wide.toSet()
         /** Height the tile blocks freed. */
         var tiles = 0
-        // Tiles: the cells of consecutive rows form a block, and a visible one takes the place
-        // of the cell that is as many places before it as there are hidden ones before it.
+        // Tiles: the cells of consecutive rows form a block, and its visible ones are placed
+        // anew from the first hidden one on. Tiles differ in height, so places are not swapped.
         val sorted = single.sortedWith(compareBy({ it.cell.top }, { it.cell.left }))
         var start = 0
         var bottom = 0
@@ -436,28 +530,47 @@ object MenuHideHook {
             if (i < sorted.size) bottom = sorted[i].cell.bottom
             if (block.isEmpty()) continue
             val first = block[0].cell
-            val columns = maxOf(1, root.width / maxOf(1, first.width))
-            var before = 0
-            var lastUsed = -1
-            for ((at, e) in block.withIndex()) {
-                // A list keeps only the cells on screen: what was counted while the hidden
-                // ones before this cell were there still holds once they have scrolled away.
-                val tree = treeOf(e.cell)
-                before = maxOf(before, shifts[tree] ?: 0)
-                if (tree != null) shifts[tree] = before
-                if (e.hit.hidden) { before++; continue }
-                if (before == 0) { lastUsed = at; continue }
-                val to = at - before
-                lastUsed = maxOf(lastUsed, to)
-                slotMove[e.cell] = if (to >= 0) {
-                    (block[to].cell.left - e.cell.left).toFloat() to (block[to].cell.top - e.cell.top).toFloat()
-                } else {
-                    // Its place is in a row that has scrolled away: somewhere above the block.
-                    0f to (first.top - e.cell.top - first.height * ((columns - 1 - to) / columns)).toFloat()
-                }
+            val cw = maxOf(1, first.width)
+            val columns = maxOf(1, root.width / cw)
+            val x0 = first.left - (first.left / cw).coerceIn(0, columns - 1) * cw
+            // A list keeps only the cells on screen. With the block's first tiles scrolled away
+            // the hidden ones among them are not known: the tiles then keep the move that was
+            // worked out while those were there.
+            val whole = first.top > 0 || (0 until root.childCount).any { root.getChildAt(it).top < first.top }
+            if (whole && block.none { it.hit.hidden }) {
+                for (e in block) treeOf(e.cell)?.let { moves.remove(it) }
+                continue
             }
-            val usedBottom = if (lastUsed < 0) first.top
-                else block.filter { it.cell.top == block[lastUsed].cell.top }.maxOf { it.cell.bottom }
+            /** Where each column ends so far; unknown until a tile has been placed in it. */
+            val ends = IntArray(columns) { if (whole) first.top else Int.MIN_VALUE }
+            var moving = false
+            for (e in block) {
+                val c = e.cell
+                val tree = treeOf(c)
+                if (e.hit.hidden) { moving = true; continue }
+                val own = ((c.left - x0) / cw).coerceIn(0, columns - 1)
+                val known = if (whole) null else moves[tree]
+                val column: Int
+                val y: Int
+                if (known != null) {
+                    column = ((c.left + known.first - x0) / cw).coerceIn(0, columns - 1)
+                    y = c.top + known.second
+                } else if ((whole && !moving) || ends.any { it == Int.MIN_VALUE }) {
+                    // Before the first hidden tile, or with nothing to go by: it stays.
+                    column = own
+                    y = c.top
+                } else {
+                    // The list puts a tile into the column that ends higher: so does this.
+                    column = ends.indices.minByOrNull { ends[it] } ?: own
+                    y = ends[column]
+                }
+                ends[column] = maxOf(ends[column], y + c.height)
+                val dx = x0 + column * cw - c.left
+                val dy = y - c.top
+                if (tree != null) moves[tree] = dx to dy
+                if (dx != 0 || dy != 0) slotMove[c] = dx.toFloat() to dy.toFloat()
+            }
+            val usedBottom = ends.maxOrNull()?.takeIf { it != Int.MIN_VALUE } ?: blockBottom
             if (blockBottom > usedBottom) {
                 freed += blockBottom to (blockBottom - usedBottom).toFloat()
                 tiles += blockBottom - usedBottom
@@ -486,6 +599,7 @@ object MenuHideHook {
         return freed.sumOf { it.second.toDouble() }.toFloat()
     }
 
+    private val TAG_MORE = 0x7f0fba07
     private val TAG_FREED = 0x7f0fba06
     private val TAG_WATCH = 0x7f0fba05
     private val TAG_AGAIN = 0x7f0fba04
@@ -493,12 +607,16 @@ object MenuHideHook {
     private val TAG_PENDING = 0x7f0fba02
     private val TAG_HIDDEN = 0x7f0fba01
 
-    private fun hitOf(v: View): Hit? {
+    private fun listenerOf(v: View): Any? {
         val li = listenerInfoField?.get(v) ?: return null
         val f = clickField ?: runCatching {
             li.javaClass.getDeclaredField("mOnClickListener").apply { isAccessible = true }
         }.getOrNull()?.also { clickField = it } ?: return null
-        val listener = f.get(li) ?: return null
+        return f.get(li)
+    }
+
+    private fun hitOf(v: View): Hit? {
+        val listener = listenerOf(v) ?: return null
         hits[listener]?.let { return if (it === NONE) null else it }
         val found = Found()
         runCatching { find(listener, IdentityHashMap(), intArrayOf(0), 0, found) }
@@ -508,12 +626,17 @@ object MenuHideHook {
         val hit = when {
             id != null -> Hit(id, SECTION_OF[id], true)
             found.header != null -> Hit(0, found.header, true)
+            found.more -> MORE
             row != null -> Hit(row, SECTION_OF[row], false)
             link != null -> Hit(link, SECTION_OF[link], false)
             else -> null
         }
         hits[listener] = hit ?: NONE
-        if (hit != null) L.i(TAG, "menu entry ${if (hit.id != 0L) hit.id.toString() else "section " + hit.section}")
+        if (hit != null) L.i(TAG, "menu entry " + when {
+            hit.id != 0L -> hit.id.toString()
+            hit.more -> "see more"
+            else -> "section " + hit.section
+        })
         return hit
     }
 
@@ -521,19 +644,23 @@ object MenuHideHook {
     private class Found {
         var id: Long? = null
         var header: String? = null
+        var more = false
         /** The id of a section row, held as a number by the row itself. */
         var row: Long? = null
         var link: Long? = null
     }
 
     /** Bounded walk of the listener object graph looking for the logging JSON, a header key, a row id or a link. */
-    private fun find(o: Any?, seen: IdentityHashMap<Any, Boolean>, budget: IntArray, depth: Int, out: Found) {
-        if (o == null || out.id != null || budget[0]++ > 600 || depth > 10) return
+    private fun find(
+        o: Any?, seen: IdentityHashMap<Any, Boolean>, budget: IntArray, depth: Int, out: Found, limit: Int = 10,
+    ) {
+        if (o == null || out.id != null || out.more || budget[0]++ > 600 || depth > limit) return
         if (o is String) {
             if (o.startsWith("{\"bmid\":")) {
                 out.id = BMID.find(o)?.groupValues?.get(1)?.toLongOrNull()
             } else if (out.header == null && o.endsWith("_test_key")) {
                 out.header = HEADERS[o]
+                if (o == SEE_MORE) out.more = true
             } else if (out.link == null && (o.startsWith("fb") || o.startsWith("http"))) {
                 out.link = LINKS.firstOrNull { o.startsWith(it.first) }?.second
             }
@@ -558,8 +685,8 @@ object MenuHideHook {
                     continue
                 }
                 val value = runCatching { f.isAccessible = true; f.get(o) }.getOrNull()
-                find(value, seen, budget, depth + 1, out)
-                if (out.id != null) return
+                find(value, seen, budget, depth + 1, out, limit)
+                if (out.id != null || out.more) return
             }
             c = c.superclass
         }

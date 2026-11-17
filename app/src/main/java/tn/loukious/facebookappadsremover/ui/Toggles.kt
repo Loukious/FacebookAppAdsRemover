@@ -293,7 +293,7 @@ val TOGGLE_SECTIONS: List<ToggleSection> = listOf(
         ToggleSpec(Settings.MENU_HIDE_PREFIX + "250100865708545", "Hide Pages", "Remove Pages from the menu", false, MENU_MAIN),
         ToggleSpec(Settings.MENU_HIDE_PREFIX + "102784766491910", "Hide Find friends", "Remove Find friends from the menu", false, MENU_MAIN),
         ToggleSpec(Settings.MENU_EXPAND, "Show all entries",
-            "Open the menu fully expanded and remove the See more button. List-style menu only", false, MENU_MAIN),
+            "Open the menu fully expanded and remove the See more button", false, MENU_MAIN),
         ToggleSpec(Settings.MENU_SECTION_PREFIX + "shortcut", "Hide Your shortcuts",
             "Remove the whole Your shortcuts block", false, MENU_SHORTCUTS),
         ToggleSpec(Settings.MENU_SECTION_PREFIX + "settings", "Hide the whole section",
