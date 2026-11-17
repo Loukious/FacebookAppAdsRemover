@@ -107,6 +107,12 @@ object Settings {
      * turn its dark neutral background palette into true black. */
     const val APPEARANCE_AMOLED = "appearance.amoled"
 
+    /** Show HDR photos and videos as SDR, so the screen never switches to its HDR mode. */
+    const val APPEARANCE_NO_HDR = "appearance.noHdr"
+
+    /** Facebook's blue accent follows the system accent colour (Android 12+ dynamic colour). */
+    const val APPEARANCE_ACCENT = "appearance.systemAccent"
+
     /** Hide the floating Meta AI button of the chat list (Messenger and Facebook's own chats). */
     const val MESSENGER_HIDE_META_AI = "messenger.hideMetaAi"
 

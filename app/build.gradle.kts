@@ -94,4 +94,6 @@ dependencies {
 
     testImplementation("junit:junit:4.13.2")
     testImplementation("javax.inject:javax.inject:1")
+    testImplementation("io.github.libxposed:api:102.0.0")
+    testImplementation("org.mockito:mockito-core:5.18.0")
 }
