@@ -1,6 +1,8 @@
 package tn.loukious.facebookappadsremover.hooks
 
 import org.junit.Assert.assertEquals
+import org.junit.Assert.assertFalse
+import org.junit.Assert.assertTrue
 import org.junit.Assert.assertSame
 import org.junit.Test
 
@@ -99,5 +101,20 @@ class BloksMenuFilterTest {
     @Test fun buttonStaysWhenItsStateIsNotFound() {
         val text = fullMenu("$main,$help").replace("\"type\":\"ls\"", "\"type\":\"zz\"")
         assertSame(text, BloksMenuFilter.filter(text, BloksMenuFilter.Rules(bookmark = { false }, expand = true)))
+    }
+
+    /** Rows of a section since November 2026: no logging JSON, the id is the call's first value. */
+    private fun bare(id: Long) =
+        """\t(f43 \"click\" (abc \"bookmark_id\" \"item_id\") (dkc \"$id\" (dkc) \"$id\"))"""
+    private fun bareNumber(id: Long) =
+        """\t(f43 \"click\" (abc \"bookmark_id\" \"item_id\") (dkc (eud $id) (dkc) (eud $id)))"""
+
+    @Test fun cutsRowsNamedOnlyByBookmarkId() {
+        val text = """{"ft":{"k1":"${bare(11111)}","k2":"${bareNumber(22222)}","k3":"${script(33333)}"},""" +
+            """"tree":{"c":[${row("k1", "One")},${row("k2", "Two")},${row("k3", "Three")}]}}"""
+        val out = BloksMenuFilter.filter(text) { it == 11111L || it == 22222L }
+        assertFalse(out.contains("One"))
+        assertFalse(out.contains("Two"))
+        assertTrue(out.contains("Three"))
     }
 }

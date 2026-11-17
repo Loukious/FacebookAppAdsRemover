@@ -7,9 +7,11 @@ package tn.loukious.facebookappadsremover.hooks
  * state variables and a tree of minified components. Three things are
  * recognised in it, each by a marker that is not minified:
  *
- * - **Rows.** A row's tap script carries Facebook's logging JSON
- *   `{"bmid":<bookmark id>,...}` and the row's subtree refers to that script by
- *   its key, so a row is an array element that refers to exactly one bookmark.
+ * - **Rows.** A row's tap script names its bookmark: in Facebook's logging JSON
+ *   `{"bmid":<bookmark id>,...}`, or, for the rows of a section since November
+ *   2026, only as the first value of the logging call whose first key is
+ *   `bookmark_id`. The row's subtree refers to that script by its key, so a
+ *   row is an array element that refers to exactly one bookmark.
  * - **Sections** (Help, Settings, ...). Facebook can hide each section itself:
  *   the section's visibility script reads its key (`"help"`) from the state
  *   `PE_PLAZA_SECTIONS:is_hidden_map` and yields `"gone"` or `"visible"`.
@@ -31,6 +33,9 @@ object BloksMenuFilter {
     )
 
     private val BMID = Regex("""bmid\W{1,6}(\d{5,20})""")
+    /** `(keys "bookmark_id" ...) (values "<id>" ...` or `... (values (num <id>) ...`; the names are minified. */
+    private val BOOKMARK_ID = Regex("""bookmark_id[^)]*\)\s*\(\w+\s+(?:\\*"|\(\w+\s+)(\d{5,20})""")
+    private const val ID_KEY = "bookmark_id"
     private val QUOTED_WORD = Regex("""\\"([a-z][a-z0-9_]*)\\"""")
     private val QUOTED_ID = Regex("""\\"([0-9a-z]{4,})\\"""")
     private const val SECTIONS_STATE = "\"key\":\"PE_PLAZA_SECTIONS:is_hidden_map\""
@@ -43,7 +48,7 @@ object BloksMenuFilter {
 
     /** Returns the edited text, or [text] itself when nothing changes. */
     fun filter(text: String, rules: Rules): String {
-        if (text.length > MAX_CHARS || !text.contains("bmid")) return text
+        if (text.length > MAX_CHARS || !(text.contains("bmid") || text.contains(ID_KEY))) return text
         val scripts = scriptIds(text)
         val all = scripts.values.toSet()
         // A menu with one entry has no "rows" to tell apart from their container.
@@ -79,7 +84,8 @@ object BloksMenuFilter {
      * still cut nothing, the response format has changed.
      */
     fun namesHidden(text: String, hidden: (Long) -> Boolean): Boolean =
-        text.length <= MAX_CHARS && text.contains("bmid") && scriptIds(text).values.any(hidden)
+        text.length <= MAX_CHARS && (text.contains("bmid") || text.contains(ID_KEY)) &&
+            scriptIds(text).values.any(hidden)
 
     private class Edit(val from: Int, val to: Int, val replacement: String = "")
 
@@ -93,8 +99,11 @@ object BloksMenuFilter {
             val keyEnd = stringEnd(text, i)
             if (keyEnd + 2 < n && text[keyEnd + 1] == ':' && text[keyEnd + 2] == '"') {
                 val valueEnd = stringEnd(text, keyEnd + 2)
-                if (text.indexOf("bmid", keyEnd + 2).let { it in 0 until valueEnd }) {
-                    val ids = BMID.findAll(text.substring(keyEnd + 2, valueEnd)).map { it.groupValues[1] }.toSet()
+                if (text.indexOf("bmid", keyEnd + 2).let { it in 0 until valueEnd } ||
+                    text.indexOf(ID_KEY, keyEnd + 2).let { it in 0 until valueEnd }
+                ) {
+                    val script = text.substring(keyEnd + 2, valueEnd)
+                    val ids = (BMID.findAll(script) + BOOKMARK_ID.findAll(script)).map { it.groupValues[1] }.toSet()
                     ids.singleOrNull()?.toLongOrNull()?.let { out[text.substring(i + 1, keyEnd)] = it }
                 }
                 i = valueEnd + 1
