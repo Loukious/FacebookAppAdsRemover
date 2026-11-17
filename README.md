@@ -38,6 +38,7 @@ Everything below is available from the module's settings app. The defaults shown
    - **Turn off HDR** — keeps photos and videos at normal brightness where supported, reducing brightness jumps and preserving eye comfort mode.
 
      Video uses decoder tone mapping or an SDR surface brightness limit where Android supports it. If both are unavailable, playback continues and Diagnostics reports that HDR may remain active. Actual HDR suppression still needs testing on an HDR-capable phone.
+   - **Material You accent** — buttons, links and highlights take the system accent colour (Android 12+ dynamic colour) instead of Facebook blue.
 
 5. **Privacy**
    - **Allow screenshots & recording** — clears `FLAG_SECURE` from Facebook activities.
