@@ -290,8 +290,12 @@ object AmoledThemeHook {
         }
     }
 
+    /** Set while the module sets a colour of its own, which the colour seams must pass untouched. */
+    private val ownColor = ThreadLocal<Boolean>()
+
     private object LiteralColorArgHook : Hooker {
         override fun intercept(chain: XposedInterface.Chain): Any? {
+            if (ownColor.get() == true) return chain.proceed()
             val color = chain.args.getOrNull(0) as? Int ?: return chain.proceed()
             val replacement = literal(color)
             if (replacement == color) return chain.proceed()
@@ -369,7 +373,10 @@ object AmoledThemeHook {
             if (!FeedRecyclerLayoutHook.isFeed(group)) return result
             val canvas = chain.args.getOrNull(0) as? Canvas ?: return result
 
-            separatorPaint.color = currentFeedSeparatorColor()
+            // Paint.setColor is one of the hooked seams: the separator's colour is already final,
+            // and a muted system accent makes it dark and grey enough to be taken for a background.
+            ownColor.set(true)
+            try { separatorPaint.color = currentFeedSeparatorColor() } finally { ownColor.set(false) }
             val thickness = (group.resources.displayMetrics.density * 4f).coerceAtLeast(2f)
             for (i in 0 until group.childCount) {
                 val child = group.getChildAt(i)
@@ -409,8 +416,7 @@ object AmoledThemeHook {
                 .firstOrNull()
             if (!enabled()) return AccentColorRule.resolver(color, tokenName, accent())
             if (tokenName == NEW_NOTIFICATION_BACKGROUND) {
-                // The feed separator is drawn in this colour: it follows the accent with the rest.
-                unreadNotificationColor = AccentColorRule.resolver(color, tokenName, accent())
+                unreadNotificationColor = color
                 if (!loggedUnreadColor) {
                     loggedUnreadColor = true
                     L.i(TAG, "captured NEW_NOTIFICATION_BACKGROUND=#%08X".format(color))
@@ -420,6 +426,8 @@ object AmoledThemeHook {
         }
     }
 
-    private fun currentFeedSeparatorColor(): Int =
-        AmoledColorRule.opaqueOverBlack(unreadNotificationColor)
+    /** The separator is the unread-notification tint, so it follows the accent with it. */
+    private fun currentFeedSeparatorColor(): Int = AmoledColorRule.opaqueOverBlack(
+        AccentColorRule.resolver(unreadNotificationColor, NEW_NOTIFICATION_BACKGROUND, accent()),
+    )
 }
