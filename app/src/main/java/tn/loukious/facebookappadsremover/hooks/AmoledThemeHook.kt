@@ -71,12 +71,28 @@ object AmoledThemeHook {
      * when the phone has none or the "Material You accent" switch is off.
      * The same colour seams as AMOLED carry it: see [AccentColorRule].
      */
-    private fun accent(): IntArray? =
-        if (Settings.getBoolean(Settings.APPEARANCE_ACCENT, false)) accentPalette else null
+    private fun accent(): IntArray? = when {
+        !Settings.getBoolean(Settings.APPEARANCE_ACCENT, false) -> null
+        accentState == LOADED -> accentPalette
+        else -> loadAccentPalette()
+    }
 
-    private val accentPalette: IntArray? by lazy {
-        if (Build.VERSION.SDK_INT < Build.VERSION_CODES.S) return@lazy null
-        runCatching {
+    private const val NOT_LOADED = 0
+    private const val LOADING = 1
+    private const val LOADED = 2
+    @Volatile private var accentState = NOT_LOADED
+    @Volatile private var accentPalette: IntArray? = null
+
+    /**
+     * Reading the shades goes through Resources.getColor, which is hooked
+     * above and asks for the palette again: while it is being loaded that
+     * inner call gets none, so the shades themselves come back unchanged.
+     */
+    @Synchronized
+    private fun loadAccentPalette(): IntArray? {
+        if (accentState != NOT_LOADED) return accentPalette
+        accentState = LOADING
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) accentPalette = runCatching {
             val res = Resources.getSystem()
             intArrayOf(
                 android.R.color.system_accent1_0, android.R.color.system_accent1_10,
@@ -88,6 +104,9 @@ object AmoledThemeHook {
                 android.R.color.system_accent1_1000,
             ).map { res.getColor(it, null) }.toIntArray()
         }.onFailure { L.w(TAG, "system accent palette unavailable", it) }.getOrNull()
+        accentState = LOADED
+        accentPalette?.let { L.i(TAG, "system accent palette: " + it.joinToString(" ") { c -> "#%06X".format(c and 0xFFFFFF) }) }
+        return accentPalette
     }
 
     /** AMOLED first, then the accent: a colour AMOLED blackened is no longer blue. */
