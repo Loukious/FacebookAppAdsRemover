@@ -28,6 +28,7 @@ import androidx.compose.foundation.layout.navigationBars
 import androidx.compose.foundation.layout.only
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.safeDrawing
+import androidx.compose.foundation.layout.windowInsetsPadding
 import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.lazy.LazyColumn
@@ -68,6 +69,7 @@ import androidx.compose.ui.text.font.FontFamily
 import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.unit.IntOffset
 import androidx.compose.ui.unit.dp
+import tn.loukious.facebookappadsremover.core.Settings
 import tn.loukious.facebookappadsremover.BuildConfig
 import tn.loukious.facebookappadsremover.R
 
@@ -143,8 +145,10 @@ fun SettingsApp(model: SettingsModel) {
     val spatial = MaterialTheme.motionScheme.defaultSpatialSpec<IntOffset>()
     val effects = MaterialTheme.motionScheme.defaultEffectsSpec<Float>()
     var depth by remember { mutableStateOf(1) }
+    Column(Modifier.fillMaxSize()) {
     AnimatedContent(
         targetState = stack.last(),
+        modifier = Modifier.weight(1f),
         transitionSpec = {
             // Forward slides in from the right, back from the left.
             val sign = if (stack.size >= depth) 1 else -1
@@ -163,6 +167,40 @@ fun SettingsApp(model: SettingsModel) {
             is Screen.Section -> SectionScreen(model, screen.title, back!!)
             Screen.Diagnostics -> DiagnosticsScreen(model, back!!)
             Screen.About -> AboutScreen(model, back!!)
+        }
+    }
+    // One bar for every page where settings are edited, so it stays put
+    // while pages slide and is there the moment something changes.
+    val current = stack.last()
+    ApplyBar(visible = model.changed && (current == Screen.Home || current is Screen.Section), model::restartFacebook)
+    }
+}
+
+/** Pinned to the bottom while there are changes Facebook has not picked up yet. */
+@Composable
+private fun ApplyBar(visible: Boolean, restart: () -> Unit) {
+    AnimatedVisibility(
+        visible = visible,
+        enter = expandVertically(expandFrom = Alignment.Top) + fadeIn(),
+        exit = shrinkVertically(shrinkTowards = Alignment.Top) + fadeOut(),
+    ) {
+        Surface(color = MaterialTheme.colorScheme.surfaceContainerHigh, tonalElevation = 3.dp) {
+            Row(
+                Modifier
+                    .fillMaxWidth()
+                    .windowInsetsPadding(WindowInsets.safeDrawing.only(WindowInsetsSides.Horizontal + WindowInsetsSides.Bottom))
+                    .padding(horizontal = 16.dp, vertical = 12.dp),
+                verticalAlignment = Alignment.CenterVertically,
+                horizontalArrangement = Arrangement.spacedBy(12.dp),
+            ) {
+                Icon(painterResource(R.drawable.ic_restart), contentDescription = null)
+                Text(
+                    "Restart Facebook to apply changes",
+                    Modifier.weight(1f),
+                    style = MaterialTheme.typography.bodyLarge,
+                )
+                Button(onClick = restart) { Text("Restart") }
+            }
         }
     }
 }
@@ -222,21 +260,6 @@ private fun summaryFor(model: SettingsModel, section: ToggleSection): String {
 private fun HomeScreen(model: SettingsModel, list: LazyListState, open: (Screen) -> Unit) {
     SettingsScaffold("Ads Remover", onBack = null, listState = list) {
         item("status") { StatusCard(model.moduleState, model.frameworkDetail) }
-        item("apply") {
-            // Appears only once something changed since the last restart.
-            AnimatedVisibility(
-                visible = model.changed,
-                enter = expandVertically() + fadeIn(),
-                exit = shrinkVertically() + fadeOut(),
-            ) {
-                RowGroup(listOf { shape ->
-                    NavigationRow(
-                        shape, R.drawable.ic_restart, "Apply changes",
-                        "Restart Facebook so new settings take effect",
-                    ) { model.restartFacebook() }
-                }, Modifier.padding(top = 4.dp))
-            }
-        }
         val sections = TOGGLE_SECTIONS
         item("filters") {
             SectionHeader("Filters")
@@ -284,30 +307,50 @@ private fun SectionScreen(model: SettingsModel, title: String, back: () -> Unit)
         SECTION_INFO[title]?.intro?.let { intro ->
             item("intro") { Footnote(intro, Modifier.padding(bottom = 4.dp)) }
         }
+        // A page with sub-headings (Menu): one block of switches per heading, in declaration order.
+        for (group in section.toggles.mapNotNull { it.group }.distinct()) {
+            item("group:$group") {
+                SectionHeader(group)
+                RowGroup(section.toggles.filter { it.group == group }.map { spec ->
+                    { shape ->
+                        SwitchRow(
+                            shape, TOGGLE_ICONS[spec.key], spec.title, spec.subtitle,
+                            checked = model.isOn(spec), enabled = model.bound,
+                        ) { model.setOn(spec, it) }
+                    }
+                })
+            }
+        }
         item("rows") {
             val rows = ArrayList<@Composable (androidx.compose.ui.graphics.Shape) -> Unit>()
-            for (spec in section.toggles) {
+            for (spec in section.toggles.filter { it.group == null }) {
                 rows += { shape ->
                     SwitchRow(
                         shape, TOGGLE_ICONS[spec.key], spec.title, spec.subtitle,
                         checked = model.isOn(spec), enabled = model.bound,
                     ) { model.setOn(spec, it) }
                 }
-            }
-            when (section.extra) {
-                SectionExtra.KEYWORDS -> rows += { shape ->
-                    ContentRow(shape) {
-                        OutlinedTextField(
-                            value = model.keywords,
-                            onValueChange = model::updateKeywords,
-                            enabled = model.bound,
-                            label = { Text("Keywords") },
-                            placeholder = { Text("giveaway, crypto, follow me on") },
-                            maxLines = 3,
-                            modifier = Modifier.fillMaxWidth(),
-                        )
+                // The keyword list belongs to its switch: right under it, and only while it is on.
+                if (section.extra == SectionExtra.KEYWORDS &&
+                    spec.key == Settings.FEED_KEYWORDS_ENABLED && model.isOn(spec)
+                ) {
+                    rows += { shape ->
+                        ContentRow(shape) {
+                            OutlinedTextField(
+                                value = model.keywords,
+                                onValueChange = model::updateKeywords,
+                                enabled = model.bound,
+                                label = { Text("Keywords") },
+                                placeholder = { Text("giveaway, crypto, follow me on") },
+                                maxLines = 3,
+                                modifier = Modifier.fillMaxWidth(),
+                            )
+                        }
                     }
                 }
+            }
+            when (section.extra) {
+                SectionExtra.KEYWORDS -> {} // drawn with its switch above
                 SectionExtra.SESSION -> rows += { shape ->
                     ContentRow(shape) {
                         Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
@@ -369,6 +412,17 @@ private fun DiagnosticsScreen(model: SettingsModel, back: () -> Unit) {
                 "A report of what the module found inside Facebook. Attach it when you report a problem. " +
                     "Facebook must have been opened at least once.",
             )
+        }
+        item("debug") {
+            RowGroup(DEBUG_TOGGLES.map<ToggleSpec, @Composable (androidx.compose.ui.graphics.Shape) -> Unit> { spec ->
+                { shape ->
+                    SwitchRow(
+                        shape, TOGGLE_ICONS[spec.key], spec.title, spec.subtitle,
+                        checked = model.isOn(spec), enabled = model.bound,
+                    ) { model.setOn(spec, it) }
+                }
+            })
+            Spacer(Modifier.height(8.dp))
         }
         item("actions") {
             val busy = model.reportLoading

@@ -1002,7 +1002,11 @@ object GameAdsHook {
         ).forEach { className ->
             runCatching {
                 tryHookAudienceNetworkRewardClass(module, classLoader.loadClass(className))
-            }.onFailure { L.w(TAG, "Audience Network reward class hook failed: $className", it) }
+            }.onFailure {
+                // The SDK's dex attaches later, with the first game: the watcher below hooks it then.
+                if (it is ClassNotFoundException) L.i(TAG, "Audience Network class not loaded yet: $className")
+                else L.w(TAG, "Audience Network reward class hook failed: $className", it)
+            }
         }
 
         // Dynamically loaded SDK classes: the dex attaches after install, so
