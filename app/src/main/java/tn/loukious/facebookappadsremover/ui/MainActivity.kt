@@ -127,7 +127,7 @@ class MainActivity : ComponentActivity(), SettingsModel {
     private fun onServiceReady(detail: String?) {
         if (bound) return
         // Load the real stored state, then unlock the switches.
-        for (spec in TOGGLE_SECTIONS.flatMap { it.toggles }) {
+        for (spec in TOGGLE_SECTIONS.flatMap { it.toggles } + DEBUG_TOGGLES) {
             values[spec.key] = prefs?.getBoolean(spec.key, spec.default) ?: spec.default
         }
         keywords = prefs?.getString(Settings.FEED_KEYWORDS, "") ?: ""

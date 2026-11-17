@@ -43,6 +43,11 @@ import java.lang.reflect.Method
  *     refreshForRevisit(..., "onAppForeground", ...) plus the
  *     decideForegroundAutoScroll auto-scroll.
  *
+ * 588 (verified 2026-11-16): refreshForRevisit lost a parameter (5 now, the
+ * reason is still args[4]); the warm-start check is `(long, String): int` and
+ * exists twice (adapter + subclass override); NewsFeedFragment.onAppForeground
+ * is `A0z()`.
+ *
  * Deliberate deviation: none — setResult(null) maps to returning the default
  * value per return type (false/0/null), exactly what Xposed's setResult(null)
  * coerced to in the mod.
@@ -65,8 +70,11 @@ object AutoRefreshHook {
         HookTarget(
             key = "$CACHE_KEY.warmStart",
             description = "BaseFeedCSRDataLoaderAdapter maybeRefreshForWarmStart (mod: WPUwyv blocker)",
+            // 588 has two: the adapter's method and a subclass override that
+            // logs "maybeRefreshForWarmStart skipped: ..." and calls super.
+            multi = true,
         ) { bridge: DexKitBridge ->
-            bridge.findMethod { matcher { usingStrings("maybeRefreshForWarmStart") } }
+            bridge.findMethod { matcher { returnType = "int"; usingStrings("maybeRefreshForWarmStart") } }
         },
         HookTarget(
             key = "$CACHE_KEY.force",
@@ -78,7 +86,15 @@ object AutoRefreshHook {
             key = "$CACHE_KEY.foreground",
             description = "NewsFeedFragment onAppForeground trigger (mod: Bz8RgS blocker)",
         ) { bridge: DexKitBridge ->
-            bridge.findMethod { matcher { usingStrings("onAppForeground") } }
+            // "onAppForeground" alone is a substring of a dozen unrelated
+            // literals in 588 ("onAppForegrounded", ...). The feed's handler is
+            // the one that passes it, as the reason, to refreshForRevisit.
+            bridge.findMethod {
+                matcher {
+                    usingEqStrings("onAppForeground")
+                    invokeMethods { add { name = "refreshForRevisit" } }
+                }
+            }.ifEmpty { bridge.findMethod { matcher { usingStrings("onAppForeground") } } }
         },
     )
 
