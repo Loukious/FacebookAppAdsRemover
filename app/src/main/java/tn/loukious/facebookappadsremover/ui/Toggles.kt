@@ -196,7 +196,7 @@ val TOGGLE_SECTIONS: List<ToggleSection> = listOf(
         ToggleSpec(
             Settings.APPEARANCE_NO_HDR,
             "Turn off HDR",
-            "Show photos and videos without HDR, so the screen keeps its brightness and eye comfort mode",
+            "Keep normal brightness and eye comfort mode where supported; check Diagnostics if HDR remains",
             false,
         ),
     )),

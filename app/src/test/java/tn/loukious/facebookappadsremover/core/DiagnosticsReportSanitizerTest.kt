@@ -23,6 +23,20 @@ class DiagnosticsReportSanitizerTest {
         for (line in lines) assertEquals(line, DiagnosticsReportSanitizer.sanitizeLine(line))
     }
 
+    @Test fun preservesHdrSupportDiagnosticsWithoutAdmittingMediaPayloads() {
+        for (message in listOf(
+            "HDR off: 15 platform hooks; surface fallback=true",
+            "decoder SDR request accepted",
+            "decoder SDR request unsupported; SDR surface headroom fallback enabled",
+            "decoder SDR request unsupported; surface headroom unavailable; HDR may remain active",
+            "surface HDR cap failed",
+        )) {
+            val line = log("FBAR.Hdr", message)
+            assertEquals(line, DiagnosticsReportSanitizer.sanitizeLine(line))
+        }
+        assertNull(DiagnosticsReportSanitizer.sanitizeLine(log("FBAR.Hdr", "VIDEO private family photo")))
+    }
+
     @Test fun omitsActualMediaPlaybackAndRepostProducerFormats() {
         val lines = listOf(
             log("FBAR.VideoResume", "saved 123456789012345 at 32000ms (mod log: stop-hook)"),

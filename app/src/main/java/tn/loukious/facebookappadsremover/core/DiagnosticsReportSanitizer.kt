@@ -17,7 +17,7 @@ internal object DiagnosticsReportSanitizer {
         "FBAR.Account", "FBAR.Activity", "FBAR.Ads", "FBAR.AdsOptOut",
         "FBAR.Amoled", "FBAR.Background", "FBAR.Browser", "FBAR.CleanUrl",
         "FBAR.ContextDownload", "FBAR.Download", "FBAR.Feed", "FBAR.FeedGuard",
-        "FBAR.GameAds", "FBAR.Marketplace", "FBAR.NavTabs", "FBAR.Privacy",
+        "FBAR.GameAds", "FBAR.Hdr", "FBAR.Marketplace", "FBAR.NavTabs", "FBAR.Privacy",
         "FBAR.Refresh", "FBAR.Theme", "FBAR.Tray", "FBAR.VideoResume",
     )
     private val modulePrefixes = listOf(
@@ -44,6 +44,7 @@ internal object DiagnosticsReportSanitizer {
     // Intent/media payloads. In particular, an arbitrary message containing
     // "hooked" or "installed" must never qualify as a diagnostic.
     private val hookPrefixes = mapOf(
+        "FBAR.Hdr" to listOf("HDR off:", "decoder SDR request ", "surface HDR cap "),
         "FBAR.Account" to listOf("no instance equals()"),
         "FBAR.Activity" to listOf(
             "activity-list dump armed on Activity.startActivityForResult",

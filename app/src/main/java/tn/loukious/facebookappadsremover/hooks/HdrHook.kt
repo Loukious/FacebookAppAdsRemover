@@ -4,13 +4,16 @@ import android.content.res.Configuration
 import android.media.MediaCodec
 import android.media.MediaFormat
 import android.view.Display
+import android.view.SurfaceView
 import android.view.Window
 import android.view.WindowManager
 import io.github.libxposed.api.XposedInterface
 import io.github.libxposed.api.XposedInterface.Hooker
 import tn.loukious.facebookappadsremover.core.L
 import tn.loukious.facebookappadsremover.core.Settings
+import java.lang.reflect.Constructor
 import java.lang.reflect.Method
+import java.util.Collections
 import java.lang.reflect.Modifier
 
 /**
@@ -27,8 +30,12 @@ import java.lang.reflect.Modifier
  *   [Configuration.isScreenHdr]);
  * - a window is not put into the HDR colour mode and gets no HDR headroom,
  *   whether that is asked of the window or of its layout params;
- * - a video decoder is asked to deliver SDR, so a video that really is HDR is
- *   tone-mapped by the decoder where the phone can do that (Android 12+).
+ * - a video decoder is asked to deliver SDR and its accepted input format is checked;
+ * - independent video surfaces are capped at SDR headroom where the platform
+ *   supports it, including when the decoder cannot tone-map the HDR stream.
+ *
+ * Older platforms without either facility retain playback and report the limitation.
+ * HDR color metadata is preserved: labelling an HDR buffer as SDR is not tone mapping.
  *
  * Methods a phone's Android version does not have are skipped.
  */
@@ -40,7 +47,17 @@ object HdrHook {
     private const val KEY_TRANSFER_REQUEST = "color-transfer-request"
     private const val TRANSFER_SDR = 3
 
+    private const val SDR_HEADROOM = 1f // 0f means automatic HDR, not SDR.
+    private const val TRANSACTION = "android.view.SurfaceControl\$Transaction"
+    private const val SURFACE_BUILDER = "android.view.SurfaceControl\$Builder"
+
     @Volatile private var installed = false
+    @Volatile private var surfaceFallbackInstalled = false
+    private var surfaceCap: Method? = null
+    private var transactionCtor: Constructor<*>? = null
+    private var transactionApply: Method? = null
+    private var transactionClose: Method? = null
+    private val reported = Collections.synchronizedSet(HashSet<String>())
 
     private fun enabled() = Settings.getBoolean(Settings.APPEARANCE_NO_HDR, false)
 
@@ -59,10 +76,72 @@ object HdrHook {
             count += hook(module, methods(cls, "setColorMode", 1), ColorMode)
             count += hook(module, methods(cls, "setDesiredHdrHeadroom", 1), Headroom)
         }
+        count += installSurfaceCaps(module)
         count += hook(module, methods(MediaCodec::class.java, "configure", 4), Decoder)
         installed = count > 0
-        if (installed) L.i(TAG, "HDR off: $count platform hooks")
+        if (installed) L.i(TAG, "HDR off: $count platform hooks; surface fallback=$surfaceFallbackInstalled")
         return installed
+    }
+
+    private fun installSurfaceCaps(module: XposedInterface): Int {
+        var count = 0
+        val viewSetter = methods(SurfaceView::class.java, "setDesiredHdrHeadroom", 1)
+            .singleOrNull { it.parameterTypes[0] == Float::class.javaPrimitiveType }
+        if (viewSetter != null) {
+            count += hook(module, listOf(viewSetter), Headroom)
+            // Apply the default even if Facebook never calls the HDR setter. Attaching
+            // occurs after subclass construction and before the first surface layout.
+            count += hook(module, methods(SurfaceView::class.java, "onAttachedToWindow", 0), object : Hooker {
+                override fun intercept(chain: XposedInterface.Chain): Any? {
+                    val result = chain.proceed()
+                    if (enabled()) runCatching { viewSetter.invoke(chain.thisObject, SDR_HEADROOM) }
+                        .onFailure { L.w(TAG, "surface HDR cap failed", it) }
+                    return result
+                }
+            })
+        }
+        val transaction = runCatching { Class.forName(TRANSACTION) }.getOrNull() ?: return count
+        val cap = methods(transaction, "setDesiredHdrHeadroom", 2)
+            .singleOrNull { it.parameterTypes[1] == Float::class.javaPrimitiveType }
+        if (cap != null) {
+            count += hook(module, listOf(cap), Headroom)
+            runCatching {
+                surfaceCap = cap
+                transactionCtor = transaction.getDeclaredConstructor().apply { isAccessible = true }
+                transactionApply = transaction.getDeclaredMethod("apply")
+                transactionClose = transaction.getDeclaredMethod("close")
+                val builder = Class.forName(SURFACE_BUILDER)
+                val builds = methods(builder, "build", 0)
+                val added = hook(module, builds, SurfaceBuilt)
+                surfaceFallbackInstalled = added > 0
+                count += added
+            }.onFailure { L.w(TAG, "surface HDR cap unavailable", it) }
+        }
+        // This setter overrides desired headroom. Preserve the buffer's real ratio,
+        // changing only its requested display brightness to avoid incorrect colors.
+        count += hook(module, methods(transaction, "setExtendedRangeBrightness", 3), ExtendedBrightness)
+        return count
+    }
+
+    private fun capSurface(surface: Any) {
+        val ctor = transactionCtor ?: return
+        runCatching {
+            val transaction = ctor.newInstance()
+            try {
+                surfaceCap!!.invoke(transaction, surface, SDR_HEADROOM)
+                transactionApply!!.invoke(transaction)
+            } finally {
+                transactionClose!!.invoke(transaction)
+            }
+        }.onFailure { L.w(TAG, "surface HDR cap failed", it) }
+    }
+
+    private object SurfaceBuilt : Hooker {
+        override fun intercept(chain: XposedInterface.Chain): Any? {
+            val result = chain.proceed()
+            if (enabled() && result != null) capSurface(result)
+            return result
+        }
     }
 
     private fun methods(cls: Class<*>, name: String, params: Int): List<Method> =
@@ -102,22 +181,55 @@ object HdrHook {
         override fun intercept(chain: XposedInterface.Chain): Any? {
             if (!enabled()) return chain.proceed()
             val args = chain.args.toTypedArray()
-            args[0] = 0f // no preference: the window is not HDR anyway
+            val index = args.indexOfFirst { it is Float }
+            if (index < 0) return chain.proceed()
+            args[index] = SDR_HEADROOM
+            return chain.proceed(args)
+        }
+    }
+
+    private object ExtendedBrightness : Hooker {
+        override fun intercept(chain: XposedInterface.Chain): Any? {
+            if (!enabled()) return chain.proceed()
+            val args = chain.args.toTypedArray()
+            args[2] = SDR_HEADROOM
             return chain.proceed(args)
         }
     }
 
     private object Decoder : Hooker {
         override fun intercept(chain: XposedInterface.Chain): Any? {
-            if (enabled()) runCatching {
-                val format = chain.args.getOrNull(0) as? MediaFormat
-                val flags = chain.args.filterIsInstance<Int>().firstOrNull() ?: 0
-                val video = format?.getString(MediaFormat.KEY_MIME)?.startsWith("video/") == true
-                if (video && flags and MediaCodec.CONFIGURE_FLAG_ENCODE == 0) {
-                    format!!.setInteger(KEY_TRANSFER_REQUEST, TRANSFER_SDR)
+            if (!enabled()) return chain.proceed()
+            val format = chain.args.getOrNull(0) as? MediaFormat ?: return chain.proceed()
+            val flags = chain.args.filterIsInstance<Int>().firstOrNull() ?: 0
+            val requested = runCatching {
+                if (format.getString(MediaFormat.KEY_MIME)?.startsWith("video/") != true ||
+                    flags and MediaCodec.CONFIGURE_FLAG_ENCODE != 0
+                ) false else {
+                    format.setInteger(KEY_TRANSFER_REQUEST, TRANSFER_SDR)
+                    true
+                }
+            }.getOrDefault(false)
+            // Configure first: only its resulting input format acknowledges support.
+            // Codec failures propagate unchanged; do not inspect an unconfigured codec.
+            val result = chain.proceed()
+            if (requested) {
+                val transfer = runCatching {
+                    (chain.thisObject as? MediaCodec)?.inputFormat?.let { accepted ->
+                        if (accepted.containsKey(KEY_TRANSFER_REQUEST)) accepted.getInteger(KEY_TRANSFER_REQUEST) else 0
+                    }
+                }.getOrNull()
+                val status = if (transfer == TRANSFER_SDR) "decoder SDR request accepted" else {
+                    val state = if (transfer == null) "unverified" else "unsupported"
+                    val fallback = if (surfaceFallbackInstalled) "SDR surface headroom fallback enabled"
+                        else "surface headroom unavailable; HDR may remain active"
+                    "decoder SDR request $state; $fallback"
+                }
+                if (reported.add(status)) {
+                    if (transfer == TRANSFER_SDR) L.i(TAG, status) else L.w(TAG, status)
                 }
             }
-            return chain.proceed()
+            return result
         }
     }
 }
