@@ -37,7 +37,8 @@ import java.util.WeakHashMap
  * bar reads the old way until Messenger is started once more.
  *
  * Messenger gets nothing else of the module: this hook is installed there on
- * the first activity, with the settings it needs.
+ * the first activity, with the settings it needs. With both switches off
+ * nothing is hooked in either app.
  */
 object MetaAiButtonHook {
     private const val TAG = "FBAR.MetaAi"
@@ -45,6 +46,8 @@ object MetaAiButtonHook {
     private const val COMPONENT_HOST = "com.facebook.litho.ComponentHost"
     private const val LITHO_VIEW = "com.facebook.litho.LithoView"
     private const val BUTTON = "AI_FAB"
+    private const val STATE = "fab"
+    private const val STATE_EXPANDED = "fab_expanded"
     private const val SEARCH_BAR = "search_bar_button_tag"
     private const val STORE = "fbar_meta_ai"
     private const val STORE_HINT = "searchHint"
@@ -53,6 +56,8 @@ object MetaAiButtonHook {
 
     @Volatile private var installed = false
     @Volatile private var waiting = false
+    /** Set in the Messenger process, where the button's enum alone settles it: see [isButton]. */
+    @Volatile private var inMessenger = false
 
     /** listener object -> whether it is the Meta AI button's. Keyed by listener: Litho recycles hosts. */
     private val verdicts = Collections.synchronizedMap(WeakHashMap<Any, Boolean>())
@@ -79,6 +84,7 @@ object MetaAiButtonHook {
     fun startInMessenger(module: XposedInterface) {
         if (waiting) return
         waiting = true
+        inMessenger = true
         val onResume = Activity::class.java.getDeclaredMethod("onResume").apply { isAccessible = true }
         module.hook(onResume).intercept(object : Hooker {
             override fun intercept(chain: XposedInterface.Chain): Any? {
@@ -96,7 +102,13 @@ object MetaAiButtonHook {
     @Synchronized
     fun install(module: XposedInterface, classLoader: ClassLoader, context: Context? = null): Boolean {
         if (installed) return true
-        if (context != null && plainSearch()) runCatching { installText(module, context) }
+        val search = context != null && plainSearch()
+        if (!enabled() && !search) {
+            // Both switches are off: nothing is hooked, and turning one on asks for a restart anyway.
+            installed = true
+            return true
+        }
+        if (search) runCatching { installText(module, context!!) }
             .onFailure { L.w(TAG, "search text hooks failed", it) }
         val cls = runCatching { Class.forName(COMPONENT_HOST, false, classLoader) }.getOrNull() ?: return false
         var count = 0
@@ -211,7 +223,11 @@ object MetaAiButtonHook {
     private fun isButton(v: View): Boolean {
         val listener = listenerOf(v) ?: return false
         return verdicts.getOrPut(listener) {
-            val found = runCatching { find(listener, IdentityHashMap(), intArrayOf(0), 0) }.getOrDefault(false)
+            val marks = Marks()
+            runCatching { find(listener, IdentityHashMap(), intArrayOf(0), 0, marks) }
+            // Facebook has far more buttons and shared objects than Messenger: there a constant
+            // of the enum is not enough, the listener must also name the button's own state.
+            val found = marks.kind && (inMessenger || marks.state)
             if (found) L.i(TAG, "Meta AI button found")
             found
         }
@@ -243,24 +259,35 @@ object MetaAiButtonHook {
         }
     }
 
-    /** Bounded walk of the listener object graph looking for a constant of the Meta AI button's enum. */
-    private fun find(o: Any?, seen: IdentityHashMap<Any, Boolean>, budget: IntArray, depth: Int): Boolean {
-        if (o == null || budget[0]++ > BUDGET || depth > DEPTH) return false
-        if (o is Enum<*>) return isButtonKind(o)
-        if (o is String || o is Number || o is Boolean || o is Char) return false
-        if (o is Context || o is View || o is Collection<*> || o is Map<*, *>) return false
-        if (seen.put(o, true) != null) return false
+    /** What the walk has seen: a constant of the button's enum, and the button's state name. */
+    private class Marks {
+        var kind = false
+        var state = false
+    }
+
+    /**
+     * Bounded walk of the listener object graph. The Meta AI button's listener
+     * holds a constant of its enum and, as the item its click selects, the
+     * string `fab` or `fab_expanded`.
+     */
+    private fun find(o: Any?, seen: IdentityHashMap<Any, Boolean>, budget: IntArray, depth: Int, out: Marks) {
+        if (o == null || budget[0]++ > BUDGET || depth > DEPTH) return
+        if (out.kind && (out.state || inMessenger)) return
+        if (o is Enum<*>) { if (isButtonKind(o)) out.kind = true; return }
+        if (o is String) { if (o == STATE || o == STATE_EXPANDED) out.state = true; return }
+        if (o is Number || o is Boolean || o is Char) return
+        if (o is Context || o is View || o is Collection<*> || o is Map<*, *>) return
+        if (seen.put(o, true) != null) return
         val cls = o.javaClass
-        if (cls.isArray || cls.name.startsWith("android.") || cls.name.startsWith("java.")) return false
+        if (cls.isArray || cls.name.startsWith("android.") || cls.name.startsWith("java.")) return
         var c: Class<*>? = cls
         while (c != null && c != Any::class.java) {
             for (f in c.declaredFields) {
                 if (Modifier.isStatic(f.modifiers) || f.type.isPrimitive) continue
                 val value = runCatching { f.isAccessible = true; f.get(o) }.getOrNull()
-                if (find(value, seen, budget, depth + 1)) return true
+                find(value, seen, budget, depth + 1, out)
             }
             c = c.superclass
         }
-        return false
     }
 }
