@@ -1,6 +1,10 @@
 package tn.loukious.facebookappadsremover.hooks
 
+import android.content.ComponentCallbacks
+import android.content.Context
+import android.content.res.AssetManager
 import android.content.res.ColorStateList
+import android.content.res.Configuration
 import android.content.res.Resources
 import android.content.res.TypedArray
 import android.graphics.Canvas
@@ -71,47 +75,69 @@ object AmoledThemeHook {
      * when the phone has none or the "Material You accent" switch is off.
      * The same colour seams as AMOLED carry it: see [AccentColorRule].
      */
-    private fun accent(): IntArray? = when {
-        !Settings.getBoolean(Settings.APPEARANCE_ACCENT, false) -> null
-        accentState == LOADED -> accentPalette
-        else -> loadAccentPalette()
+    private fun accent(): IntArray? {
+        if (readingAccentPalette.get() == true ||
+            !Settings.getBoolean(Settings.APPEARANCE_ACCENT, false)) return null
+        val res = accentResources ?: return null
+        val cached = accentSnapshot
+        return if (cached != null && cached.assets === res.assets) cached.palette
+        else loadAccentPalette(res)
     }
 
-    private const val NOT_LOADED = 0
-    private const val LOADING = 1
-    private const val LOADED = 2
-    @Volatile private var accentState = NOT_LOADED
-    @Volatile private var accentPalette: IntArray? = null
+    private class AccentSnapshot(val assets: AssetManager, val palette: IntArray?)
+    @Volatile private var accentResources: Resources? = null
+    @Volatile private var accentSnapshot: AccentSnapshot? = null
+    private val readingAccentPalette = ThreadLocal<Boolean>()
     /** Its own lock: the object's monitor is held while hooks are installed. */
     private val accentLock = Any()
 
     /**
-     * Reading the shades goes through Resources.getColor, which is hooked
-     * above and asks for the palette again: while it is being loaded that
-     * inner call gets none, so the shades themselves come back unchanged.
+     * Monet supplies framework colors through runtime overlays, which
+     * Resources.getSystem() ignores. The host application's resources see
+     * those overlays and are updated in place when the wallpaper changes.
      */
-    private fun loadAccentPalette(): IntArray? = synchronized(accentLock) {
-        if (accentState != NOT_LOADED) return accentPalette
-        accentState = LOADING
-        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) accentPalette = runCatching {
-            val res = Resources.getSystem()
-            intArrayOf(
-                android.R.color.system_accent1_0, android.R.color.system_accent1_10,
-                android.R.color.system_accent1_50, android.R.color.system_accent1_100,
-                android.R.color.system_accent1_200, android.R.color.system_accent1_300,
-                android.R.color.system_accent1_400, android.R.color.system_accent1_500,
-                android.R.color.system_accent1_600, android.R.color.system_accent1_700,
-                android.R.color.system_accent1_800, android.R.color.system_accent1_900,
-                android.R.color.system_accent1_1000,
-            ).map { res.getColor(it, null) }.toIntArray()
-        }.onFailure { L.w(TAG, "system accent palette unavailable", it) }.getOrNull()
-        accentState = LOADED
-        accentPalette?.let { L.i(TAG, "system accent palette: " + it.joinToString(" ") { c -> "#%06X".format(c and 0xFFFFFF) }) }
-        accentPalette
+    private fun initAccentPalette(context: Context) = synchronized(accentLock) {
+        if (accentResources != null) return@synchronized
+        val app = context.applicationContext ?: context
+        val res = app.resources
+        app.registerComponentCallbacks(object : ComponentCallbacks {
+            override fun onConfigurationChanged(newConfig: Configuration) {
+                synchronized(accentLock) { accentSnapshot = null }
+            }
+            override fun onLowMemory() = Unit
+        })
+        accentResources = res
+    }
+
+    /** Read raw shades: both AMOLED and accent hooks must pass these through. */
+    private fun loadAccentPalette(res: Resources): IntArray? = synchronized(accentLock) {
+        val assets = res.assets
+        accentSnapshot?.let { if (it.assets === assets) return it.palette }
+        readingAccentPalette.set(true)
+        val palette = try {
+            runCatching {
+                intArrayOf(
+                    android.R.color.system_accent1_0, android.R.color.system_accent1_10,
+                    android.R.color.system_accent1_50, android.R.color.system_accent1_100,
+                    android.R.color.system_accent1_200, android.R.color.system_accent1_300,
+                    android.R.color.system_accent1_400, android.R.color.system_accent1_500,
+                    android.R.color.system_accent1_600, android.R.color.system_accent1_700,
+                    android.R.color.system_accent1_800, android.R.color.system_accent1_900,
+                    android.R.color.system_accent1_1000,
+                ).map { res.getColor(it, null) }.toIntArray()
+            }.onFailure { L.w(TAG, "system accent palette unavailable", it) }.getOrNull()
+        } finally { readingAccentPalette.remove() }
+        // Overlays replace the AssetManager even if the host does not dispatch
+        // its application callbacks. Discard shades read across an asset swap.
+        if (res.assets !== assets) return null
+        accentSnapshot = AccentSnapshot(assets, palette)
+        palette?.let { L.i(TAG, "system accent palette: " + it.joinToString(" ") { c -> "#%06X".format(c and 0xFFFFFF) }) }
+        palette
     }
 
     /** AMOLED first, then the accent: a colour AMOLED blackened is no longer blue. */
     private fun literal(color: Int): Int {
+        if (readingAccentPalette.get() == true) return color
         val c = if (enabled()) AmoledColorRule.untokened(color) else color
         // Paints and resources ask this thousands of times a frame: only a colour that could be
         // swapped is worth the look at the switch and the palette.
@@ -119,7 +145,8 @@ object AmoledThemeHook {
     }
 
     @Synchronized
-    fun installFramework(module: XposedInterface): Boolean {
+    fun installFramework(module: XposedInterface, context: Context): Boolean {
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) initAccentPalette(context)
         if (frameworkInstalled) return true
         var installed = 0
 
@@ -410,6 +437,7 @@ object AmoledThemeHook {
     private object ResolverResultHook : Hooker {
         override fun intercept(chain: XposedInterface.Chain): Any? {
             val result = chain.proceed()
+            if (readingAccentPalette.get() == true) return result
             val color = result as? Int ?: return result
             val tokenName = chain.args.asSequence()
                 .mapNotNull { (it as? Enum<*>)?.name }

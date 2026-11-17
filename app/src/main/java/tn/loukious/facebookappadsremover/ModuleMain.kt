@@ -159,7 +159,7 @@ class ModuleMain : XposedModule() {
         // Morphe-style AMOLED theme. Framework seams are available as soon as
         // the app process exists; Facebook's own colour resolvers arrive with
         // the secondary dexes and are attached by the retry probe below.
-        runCatching { AmoledThemeHook.installFramework(this) }
+        runCatching { AmoledThemeHook.installFramework(this, context) }
             .onFailure { L.e(TAG, "AMOLED framework hooks failed", it) }
 
         // Platform methods only, and Facebook may ask about the screen once and keep the
