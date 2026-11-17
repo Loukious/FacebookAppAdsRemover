@@ -9,6 +9,7 @@ import android.graphics.Paint
 import android.graphics.drawable.Drawable
 import android.graphics.drawable.ColorDrawable
 import android.graphics.drawable.GradientDrawable
+import android.os.Build
 import android.view.View
 import android.view.ViewGroup
 import io.github.libxposed.api.XposedInterface
@@ -64,6 +65,36 @@ object AmoledThemeHook {
 
     private fun enabled(): Boolean =
         Settings.getBoolean(Settings.APPEARANCE_AMOLED, false)
+
+    /**
+     * The system's accent shades (`system_accent1_*`, Android 12+), or null
+     * when the phone has none or the "Material You accent" switch is off.
+     * The same colour seams as AMOLED carry it: see [AccentColorRule].
+     */
+    private fun accent(): IntArray? =
+        if (Settings.getBoolean(Settings.APPEARANCE_ACCENT, false)) accentPalette else null
+
+    private val accentPalette: IntArray? by lazy {
+        if (Build.VERSION.SDK_INT < Build.VERSION_CODES.S) return@lazy null
+        runCatching {
+            val res = Resources.getSystem()
+            intArrayOf(
+                android.R.color.system_accent1_0, android.R.color.system_accent1_10,
+                android.R.color.system_accent1_50, android.R.color.system_accent1_100,
+                android.R.color.system_accent1_200, android.R.color.system_accent1_300,
+                android.R.color.system_accent1_400, android.R.color.system_accent1_500,
+                android.R.color.system_accent1_600, android.R.color.system_accent1_700,
+                android.R.color.system_accent1_800, android.R.color.system_accent1_900,
+                android.R.color.system_accent1_1000,
+            ).map { res.getColor(it, null) }.toIntArray()
+        }.onFailure { L.w(TAG, "system accent palette unavailable", it) }.getOrNull()
+    }
+
+    /** AMOLED first, then the accent: a colour AMOLED blackened is no longer blue. */
+    private fun literal(color: Int): Int {
+        val c = if (enabled()) AmoledColorRule.untokened(color) else color
+        return AccentColorRule.literal(c, accent())
+    }
 
     @Synchronized
     fun installFramework(module: XposedInterface): Boolean {
@@ -232,17 +263,15 @@ object AmoledThemeHook {
     private object UntokenedResultHook : Hooker {
         override fun intercept(chain: XposedInterface.Chain): Any? {
             val result = chain.proceed()
-            if (!enabled()) return result
             val color = result as? Int ?: return result
-            return AmoledColorRule.untokened(color)
+            return literal(color)
         }
     }
 
     private object LiteralColorArgHook : Hooker {
         override fun intercept(chain: XposedInterface.Chain): Any? {
-            if (!enabled()) return chain.proceed()
             val color = chain.args.getOrNull(0) as? Int ?: return chain.proceed()
-            val replacement = AmoledColorRule.untokened(color)
+            val replacement = literal(color)
             if (replacement == color) return chain.proceed()
             val args = chain.args.toTypedArray()
             args[0] = replacement
@@ -252,9 +281,8 @@ object AmoledThemeHook {
 
     private object ViewBackgroundColorHook : Hooker {
         override fun intercept(chain: XposedInterface.Chain): Any? {
-            if (!enabled()) return chain.proceed()
             val color = chain.args.getOrNull(0) as? Int ?: return chain.proceed()
-            val replacement = AmoledColorRule.untokened(color)
+            val replacement = literal(color)
             if (replacement == color) return chain.proceed()
             val args = chain.args.toTypedArray()
             args[0] = replacement
@@ -353,11 +381,11 @@ object AmoledThemeHook {
     private object ResolverResultHook : Hooker {
         override fun intercept(chain: XposedInterface.Chain): Any? {
             val result = chain.proceed()
-            if (!enabled()) return result
             val color = result as? Int ?: return result
             val tokenName = chain.args.asSequence()
                 .mapNotNull { (it as? Enum<*>)?.name }
                 .firstOrNull()
+            if (!enabled()) return AccentColorRule.resolver(color, tokenName, accent())
             if (tokenName == NEW_NOTIFICATION_BACKGROUND) {
                 unreadNotificationColor = color
                 if (!loggedUnreadColor) {
@@ -365,7 +393,7 @@ object AmoledThemeHook {
                     L.i(TAG, "captured NEW_NOTIFICATION_BACKGROUND=#%08X".format(color))
                 }
             }
-            return AmoledColorRule.resolver(color, tokenName)
+            return AccentColorRule.resolver(AmoledColorRule.resolver(color, tokenName), tokenName, accent())
         }
     }
 

@@ -35,6 +35,7 @@ Everything below is available from the module's settings app. The defaults shown
 4. **Appearance**
    - **Force dark mode** — forces Facebook's dark theme.
    - **AMOLED black mode** — converts Facebook's dark neutral backgrounds to true black while preserving text, media and intentional colored surfaces.
+   - **Material You accent** — buttons, links and highlights take the system accent colour (Android 12+ dynamic colour) instead of Facebook blue.
 
 5. **Privacy**
    - **Allow screenshots & recording** — clears `FLAG_SECURE` from Facebook activities.
