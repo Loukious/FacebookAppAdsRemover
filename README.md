@@ -2,9 +2,9 @@
 
 An LSPosed/Xposed module for `com.facebook.katana` that removes ads using structural DexKit discovery plus guarded, version-specific fast paths.
 
-Original port target: Facebook `576.0.0.42.73`; development/device testing also covers `580.0.0.51.74` and `587.0.0.39.55`. Module `1.26` (versionCode 27). Discovery is primarily structural rather than based on hardcoded obfuscated class names, but an individual hook can still need revision after a Facebook update. Older versions (571 and below) are no longer supported.
+Original port target: Facebook `576.0.0.42.73`; development/device testing also covers `580.0.0.51.74` and `587.0.0.39.55`. Module `1.27` (versionCode 28). Discovery is primarily structural rather than based on hardcoded obfuscated class names, but an individual hook can still need revision after a Facebook update. Older versions (571 and below) are no longer supported.
 
-Version 1.26 updates account capture to follow the current login session and introduces section-based settings, Apply changes, and sanitized diagnostic reports. Existing settings are retained, while discovery caches refresh for the new module version.
+Version 1.27 adds Facebook menu customization, Material You accent colors, and a Turn off HDR option, improves auto-refresh blocking on Facebook 588, and reduces the release APK size. Existing settings are retained, while discovery caches refresh for the new module version. HDR suppression still needs verification on an HDR-capable phone.
 
 ## Features
 
