@@ -153,7 +153,7 @@ The settings Activity uses Jetpack Compose and Material 3 Expressive with Androi
 
 **How a toggle reaches a hook.** Feature switches live in the framework's remote-preferences group `fbar_settings` (the LSPosed/Vector daemon database), which the module app writes through the libxposed *service* library and the hooks read inside the Facebook process through `XposedInterface.getRemotePreferences`. Plain `SharedPreferences` files in either app's storage are **not** part of that channel — the daemon never reads them. Until the service binds, feature switches render with their defaults and stay disabled. Several hooks read their toggle once at install, so changes require a Facebook restart.
 
-**Apply changes** appears on the home screen after changing a feature setting or successfully importing a session, and remains available after closing or recreating settings. It waits for participating Facebook processes to exit before reopening Facebook. If the restart cannot be confirmed, changes remain pending; open Facebook and retry, or force-stop it manually. Edits made during a restart remain pending for the next apply.
+**Restart** appears in a bottom bar on Home and feature settings pages after changing a feature setting or successfully importing a session, and remains available after closing or recreating settings. It waits for participating Facebook processes to exit before reopening Facebook. If the restart cannot be confirmed, changes remain pending; open Facebook and retry, or force-stop it manually. Edits made during a restart remain pending for the next apply.
 
 Earlier settings builds wrote to local storage in the module app; those values migrate when the service binds if the remote group is empty. Hooks also retain the Facebook-process-local `fbar_prefs` fallback until the remote group has values.
 
@@ -163,7 +163,7 @@ Open Facebook before requesting a report. **Save report** and **Share report** c
 
 ### Session export / import
 
-The **Account** section holds buttons rather than switches. *Export session* copies Facebook's live authentication/login-session files, including per-account login files and the signed-in-account registry, to `Download/FacebookAppAdsRemover` as `FBAR-Session-*.json`; separately captured tokens and cookies are not added. *Import latest* restores the newest export; *Import from file…* lets you browse to any of those JSON files, for instance one copied from another device. After a successful import, return home and tap **Apply changes**. Backups contain login credentials and should be kept private.
+The **Account** section holds buttons rather than switches. *Export session* copies Facebook's live authentication/login-session files, including per-account login files and the signed-in-account registry, to `Download/FacebookAppAdsRemover` as `FBAR-Session-*.json`; separately captured tokens and cookies are not added. *Import latest* restores the newest export; *Import from file…* lets you browse to any of those JSON files, for instance one copied from another device. After a successful import, tap **Restart** in the bottom bar. Backups contain login credentials and should be kept private.
 
 The buttons send signature-protected broadcasts into the Facebook process, where `core.SessionBackup` accesses the session files.
 
