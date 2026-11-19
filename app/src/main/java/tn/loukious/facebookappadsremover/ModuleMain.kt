@@ -28,6 +28,7 @@ import tn.loukious.facebookappadsremover.hooks.GameAdsHook
 import tn.loukious.facebookappadsremover.hooks.HdrHook
 import tn.loukious.facebookappadsremover.hooks.HideSeenStoryHook
 import tn.loukious.facebookappadsremover.hooks.MarketplaceAdsHook
+import tn.loukious.facebookappadsremover.hooks.MetaAiButtonHook
 import tn.loukious.facebookappadsremover.hooks.NewsfeedFilterHook
 import tn.loukious.facebookappadsremover.hooks.NavigationTabHook
 import tn.loukious.facebookappadsremover.hooks.PrivacyHook
@@ -87,6 +88,14 @@ class ModuleMain : XposedModule() {
 
     override fun onPackageReady(param: PackageReadyParam) {
         if (!param.isFirstPackage) return
+        if (param.packageName == MetaAiButtonHook.MESSENGER) {
+            // Messenger gets one small hook and nothing of the Facebook set.
+            if (processName == MetaAiButtonHook.MESSENGER) {
+                runCatching { MetaAiButtonHook.startInMessenger(this) }
+                    .onFailure { L.w(TAG, "messenger hook failed", it) }
+            }
+            return
+        }
         if (param.packageName != FACEBOOK_PACKAGE) return
         if (ProcessFilter.isSkipped(processName)) {
             L.i(TAG, "Skipping background process $processName — no UI to patch")
@@ -260,6 +269,7 @@ class ModuleMain : XposedModule() {
     private var menuHideReady = false
     private var menuResponseReady = false
     private var navigationTabNativeReady = false
+    private var metaAiButtonReady = false
     private var discoveryRan = false
 
     private fun probeAndMaybeDiscover(context: Context) {
@@ -289,6 +299,9 @@ class ModuleMain : XposedModule() {
         }
         if (!menuResponseReady) {
             menuResponseReady = MenuResponseHook.install(this, classLoader)
+        }
+        if (!metaAiButtonReady) {
+            metaAiButtonReady = MetaAiButtonHook.install(this, classLoader)
         }
         // M4: video params capture — stable class name, needs only the
         // secondary dexes to attach (same cadence as the account hook).

@@ -113,6 +113,12 @@ object Settings {
     /** Facebook's blue accent follows the system accent colour (Android 12+ dynamic colour). */
     const val APPEARANCE_ACCENT = "appearance.systemAccent"
 
+    /** Hide the floating Meta AI button of the chat list (Messenger and Facebook's own chats). */
+    const val MESSENGER_HIDE_META_AI = "messenger.hideMetaAi"
+
+    /** Make the chat list's search bar say Search instead of Ask Meta AI or search. */
+    const val MESSENGER_PLAIN_SEARCH = "messenger.plainSearch"
+
     /** Clean URL — unwrap facebook.com/l.php?u=…&fbclid=… redirect links to
      *  the real destination when FB hands them to the browser (mod:
      *  swFbclid, X.O1EMPB7OWX4fymeZ5Qom). Default FALSE: the mod's

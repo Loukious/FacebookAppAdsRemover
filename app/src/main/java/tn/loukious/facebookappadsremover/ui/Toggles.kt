@@ -72,6 +72,8 @@ val TOGGLE_ICONS: Map<String, Int> = mapOf(
     Settings.APPEARANCE_AMOLED to R.drawable.ic_contrast,
     Settings.APPEARANCE_NO_HDR to R.drawable.ic_contrast,
     Settings.APPEARANCE_ACCENT to R.drawable.ic_sparkle,
+    Settings.MESSENGER_HIDE_META_AI to R.drawable.ic_sparkle,
+    Settings.MESSENGER_PLAIN_SEARCH to R.drawable.ic_sparkle,
     Settings.PRIVACY_ALLOW_CAPTURE to R.drawable.ic_screenshot,
     Settings.PRIVACY_BLOCK_DETECTION to R.drawable.ic_visibility_off,
     Settings.NAV_HIDE_REELS_TAB to R.drawable.ic_movie,
@@ -140,6 +142,7 @@ val SECTION_INFO: Map<String, SectionInfo> = mapOf(
         "Facebook blocks screenshots in some places and can notice when you take one. These switches stop both."),
     "Navigation" to SectionInfo(R.drawable.ic_tabs,
         "Clean up the tab bar. Hidden tabs are still reachable from the menu."),
+    "Messenger" to SectionInfo(R.drawable.ic_sparkle, "The chat list, in the Messenger app and inside Facebook."),
     "Links" to SectionInfo(R.drawable.ic_link, "Where web links open, and whether Facebook can track your clicks."),
     "Downloader" to SectionInfo(R.drawable.ic_download, "Save photos, videos, reels and stories to your phone."),
     "Video" to SectionInfo(R.drawable.ic_play, "Video playback extras."),
@@ -337,6 +340,22 @@ val TOGGLE_SECTIONS: List<ToggleSection> = listOf(
         ToggleSpec(Settings.MENU_HIDE_PREFIX + "603734381593708", "Hide WhatsApp", "Remove WhatsApp from Other Meta products", false, MENU_APPS),
         ToggleSpec(Settings.MENU_SECTION_PREFIX + "upsell", "Hide Updates",
             "Remove the Updates section with promo cards", false, MENU_UPDATES),
+    )),
+    ToggleSection("Messenger", listOf(
+        ToggleSpec(
+            Settings.MESSENGER_HIDE_META_AI,
+            "Hide Meta AI button",
+            "Remove the floating Ask Meta AI button from the chat list, in Messenger and in Facebook's own chats. " +
+                "Restart Messenger too",
+            false,
+        ),
+        ToggleSpec(
+            Settings.MESSENGER_PLAIN_SEARCH,
+            "Plain search bar",
+            "The search bar of the Messenger app says Search instead of Ask Meta AI or search. " +
+                "Shows from the second start of Messenger",
+            false,
+        ),
     )),
     ToggleSection("Links", listOf(
         ToggleSpec(

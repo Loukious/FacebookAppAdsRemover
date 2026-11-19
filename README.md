@@ -50,27 +50,31 @@ Everything below is available from the module's settings app. The defaults shown
    - **Hide Games tab** — removes only the Games/Gaming tab button.
    - **Log opened screens (for developers)** — logs activities Facebook starts, including action, URI and extras.
 
-7. **Links**
+7. **Messenger** *(add `com.facebook.orca` to the module's scope)*
+   - **Hide Meta AI button** — removes the floating Ask Meta AI button from the chat list, on every tab of the Messenger app and in the chats inside Facebook.
+   - **Plain search bar** — the Messenger search bar says Search instead of "Ask Meta AI or search".
+
+8. **Links**
    - **Open links in external browser** *(ON by default)* — opens outbound web links in your default browser; Facebook pages and login flows stay in the app.
    - **Remove link tracking** — rewrites Facebook tracking/redirect URLs to the real destination before opening them.
 
-8. **Downloader & Repost**
+9. **Downloader & Repost**
    - **Download via browser** *(ON by default)* — hands media URLs to your browser instead of the built-in downloader.
    - **Show download buttons** *(ON)* — adds media-bound download/save actions for the Reel or Story currently open.
    - **Quick download from copied link** — copying an HTTP(S) link opens the quality-fetch / quick-download flow.
    - **Repost Reels** — adds a native **Repost** action to the active Reel so it can be reposted through the module's Facebook Page posting flow.
    - **Repost Stories** — adds **Repost** to the currently open Story's three-dot menu, bound to that Story's media.
 
-9. **Video**
+10. **Video**
    - **Resume video position** — optionally restores the last saved playback position when reopening a video; manual seeking always takes priority.
    - **Background playback** — keeps the tracked video playing while Facebook is backgrounded, without a floating window.
 
-10. **Account**
+11. **Account**
     - **Export session** — exports Facebook's authentication and login-session files.
     - **Import latest** — restores the newest exported session.
     - **Import from file** — restores a session backup selected from storage.
 
-11. **Module**
+12. **Module**
     - **Show launcher icon** — show or hide the module's launcher icon without disabling the module itself.
 
 Unless marked **ON by default**, switches are **OFF by default**.
