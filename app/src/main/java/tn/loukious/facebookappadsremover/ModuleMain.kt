@@ -17,6 +17,7 @@ import tn.loukious.facebookappadsremover.hooks.MenuResponseHook
 import tn.loukious.facebookappadsremover.hooks.AdsOptOutHook
 import tn.loukious.facebookappadsremover.hooks.AmoledThemeHook
 import tn.loukious.facebookappadsremover.hooks.AutoRefreshHook
+import tn.loukious.facebookappadsremover.hooks.BackExitHook
 import tn.loukious.facebookappadsremover.hooks.BackgroundPlaybackHook
 import tn.loukious.facebookappadsremover.hooks.CleanUrlHook
 import tn.loukious.facebookappadsremover.hooks.ExternalBrowserHook
@@ -258,6 +259,7 @@ class ModuleMain : XposedModule() {
     private var amoledResolversReady = false
     private var newsfeedUiFallbackReady = false
     private var menuHideReady = false
+    private var backExitReady = false
     private var menuResponseReady = false
     private var navigationTabNativeReady = false
     private var discoveryRan = false
@@ -286,6 +288,9 @@ class ModuleMain : XposedModule() {
         }
         if (!menuHideReady) {
             menuHideReady = MenuHideHook.install(this, classLoader)
+        }
+        if (!backExitReady) {
+            backExitReady = BackExitHook.install(this, classLoader)
         }
         if (!menuResponseReady) {
             menuResponseReady = MenuResponseHook.install(this, classLoader)
