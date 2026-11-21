@@ -116,12 +116,17 @@ object BackExitHook {
         it.name == name && it.parameterCount == 0 && it.returnType == returns && !Modifier.isStatic(it.modifiers)
     }
 
-    /** `static void (reason: Enum, fragment)`: the feed's "refresh, because ...". */
+    /**
+     * `static void (reason: Enum, fragment)`: the feed's "refresh, because ...".
+     * The reason type is the enum that has the Back button among its reasons.
+     */
     internal fun isRefresh(method: Method, cls: Class<*>): Boolean {
         if (!Modifier.isStatic(method.modifiers) || method.returnType != java.lang.Void.TYPE) return false
         val params = method.parameterTypes
-        return params.size == 2 && params[0].isEnum && params[1] == cls
+        return params.size == 2 && params[1] == cls && params[0].enumConstants.orEmpty().any(::isBackReason)
     }
+
+    internal fun isBackReason(reason: Any?): Boolean = (reason as? Enum<*>)?.name == BACK_REASON
 
     /**
      * The same refresh one level down. The fragment hands out its data
@@ -130,14 +135,14 @@ object BackExitHook {
      * exit" Back calls directly, past the fragment's own method.
      */
     internal fun controllerRefreshes(cls: Class<*>, refreshes: List<Method>): List<Method> {
-        val reason = refreshes.firstOrNull()?.parameterTypes?.get(0) ?: return emptyList()
+        val reasons = refreshes.map { it.parameterTypes[0] }.toSet()
         return cls.declaredMethods.asSequence()
             .filter { Modifier.isStatic(it.modifiers) && it.parameterTypes.contentEquals(arrayOf(cls)) }
             .map { it.returnType }
             .filter { !it.isPrimitive && it != cls && it.classLoader === cls.classLoader }
             .distinct()
             .flatMap { owner -> owner.declaredMethods.asSequence() }
-            .filter { it.returnType == java.lang.Void.TYPE && it.parameterTypes.firstOrNull() == reason }
+            .filter { it.returnType == java.lang.Void.TYPE && it.parameterTypes.firstOrNull() in reasons }
             .toList()
     }
 
@@ -187,8 +192,7 @@ object BackExitHook {
      */
     private object BackRefresh : Hooker {
         override fun intercept(chain: XposedInterface.Chain): Any? {
-            val reason = chain.args.firstOrNull() as? Enum<*>
-            if (reason?.name != BACK_REASON || !Settings.getBoolean(Settings.FEED_BACK_EXITS, false)) {
+            if (!isBackReason(chain.args.firstOrNull()) || !Settings.getBoolean(Settings.FEED_BACK_EXITS, false)) {
                 return chain.proceed()
             }
             L.i(TAG, "Back refresh skipped: ${chain.executable.declaringClass.name}.${chain.executable.name}")
