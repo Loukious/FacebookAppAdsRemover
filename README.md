@@ -27,6 +27,7 @@ Everything below is available from the module's settings app. The defaults shown
    - **Hide AI-generated content** — filters stories Facebook marks as self-disclosed or Meta-detected AI content.
    - **Keyword filter** — hides feed stories containing any configured keyword, case-insensitively.
    - **Block auto-refresh** — blocks revisit, warm-start, foreground and forced News Feed refreshes.
+   - **Back leaves the feed** — Back on the News Feed leaves Facebook at once instead of scrolling to the top and refreshing.
 
 3. **Stories**
    - **View stories without marking seen** — blocks Facebook's seen-reporting controller.

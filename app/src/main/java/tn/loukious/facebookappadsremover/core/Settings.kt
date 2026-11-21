@@ -125,6 +125,9 @@ object Settings {
     /** News Feed auto-refresh block (mod: swNewsFeedAutoReload). */
     const val FEED_AUTO_REFRESH_BLOCK = "feed.autoRefreshBlock"
 
+    /** Back on the News Feed leaves the app instead of scrolling up and refreshing. */
+    const val FEED_BACK_EXITS = "feed.backExits"
+
     /** Activity list — Intent dump on every startActivityForResult
      *  (mod: navigation.activity_list.*). */
     const val NAVIGATION_ACTIVITY_LIST = "navigation.activityList"
