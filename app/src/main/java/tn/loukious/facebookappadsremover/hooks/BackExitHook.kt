@@ -26,8 +26,8 @@ import java.util.concurrent.ConcurrentHashMap
  * - `isAtTop()` answers no, which takes the "scroll up" branch, not the
  *   "refresh and ask again" one;
  * - `scrollToTop()` does nothing;
- * - the refresh that follows the scroll, a static `(reason, fragment)` method
- *   of the fragment, does nothing;
+ * - the refresh "because of the Back button" that follows the scroll does
+ *   nothing, whether the fragment starts it or its data controller does;
  *
  * and when the method returns the task goes to the background.
  *
@@ -42,6 +42,7 @@ object BackExitHook {
     private const val FRAGMENT = "androidx.fragment.app.Fragment"
     private const val ORIGINAL_NAME = "__redex_internal_original_name"
     private const val FEED = "NewsFeedFragment"
+    private const val BACK_REASON = "BACK_BUTTON_MANUAL"
 
     /** Fragment classes already looked at. */
     private val seen = ConcurrentHashMap<Class<*>, Boolean>()
@@ -98,7 +99,8 @@ object BackExitHook {
         runCatching {
             module.hook(atTop).intercept(AtTop)
             module.hook(scroll).intercept(Skip)
-            refreshes.forEach { module.hook(it).intercept(Skip) }
+            val byReason = refreshes + controllerRefreshes(cls, refreshes)
+            byReason.forEach { module.hook(it).intercept(BackRefresh) }
             module.hook(back).intercept(Back)
             if (refreshes.isEmpty()) L.w(TAG, "${cls.name}: refresh not found, Back may still refresh the feed")
             // Compiled code has the small callees inlined into onBackPressed, where
@@ -106,7 +108,7 @@ object BackExitHook {
             if (!runCatching { module.deoptimize(back) }.getOrDefault(false)) {
                 L.w(TAG, "onBackPressed not deoptimized")
             }
-            L.i(TAG, "hooked ${cls.name}: onBackPressed, isAtTop, scrollToTop, ${refreshes.size} refresh")
+            L.i(TAG, "hooked ${cls.name}: onBackPressed, isAtTop, scrollToTop, ${byReason.size} refresh")
         }.onFailure { L.w(TAG, "feed Back not hooked", it) }
     }
 
@@ -119,6 +121,24 @@ object BackExitHook {
         if (!Modifier.isStatic(method.modifiers) || method.returnType != java.lang.Void.TYPE) return false
         val params = method.parameterTypes
         return params.size == 2 && params[0].isEnum && params[1] == cls
+    }
+
+    /**
+     * The same refresh one level down. The fragment hands out its data
+     * controller through a static `(fragment)` accessor, and the controller's
+     * methods that start with the same reason type are what a "press again to
+     * exit" Back calls directly, past the fragment's own method.
+     */
+    internal fun controllerRefreshes(cls: Class<*>, refreshes: List<Method>): List<Method> {
+        val reason = refreshes.firstOrNull()?.parameterTypes?.get(0) ?: return emptyList()
+        return cls.declaredMethods.asSequence()
+            .filter { Modifier.isStatic(it.modifiers) && it.parameterTypes.contentEquals(arrayOf(cls)) }
+            .map { it.returnType }
+            .filter { !it.isPrimitive && it != cls && it.classLoader === cls.classLoader }
+            .distinct()
+            .flatMap { owner -> owner.declaredMethods.asSequence() }
+            .filter { it.returnType == java.lang.Void.TYPE && it.parameterTypes.firstOrNull() == reason }
+            .toList()
     }
 
     private object Back : Hooker {
@@ -153,10 +173,26 @@ object BackExitHook {
         }
     }
 
-    /** scrollToTop and the refresh: nothing, once the press is the feed's own. */
+    /** scrollToTop: nothing, once the press is the feed's own. */
     private object Skip : Hooker {
         override fun intercept(chain: XposedInterface.Chain): Any? {
             return if (press.get()?.own == true) null else chain.proceed()
+        }
+    }
+
+    /**
+     * A refresh "because of the Back button": never, while the switch is on.
+     * Facebook starts it from the press itself or posts it for a moment later,
+     * so it is known by its reason and not by when it runs.
+     */
+    private object BackRefresh : Hooker {
+        override fun intercept(chain: XposedInterface.Chain): Any? {
+            val reason = chain.args.firstOrNull() as? Enum<*>
+            if (reason?.name != BACK_REASON || !Settings.getBoolean(Settings.FEED_BACK_EXITS, false)) {
+                return chain.proceed()
+            }
+            L.i(TAG, "Back refresh skipped: ${chain.executable.declaringClass.name}.${chain.executable.name}")
+            return null
         }
     }
 

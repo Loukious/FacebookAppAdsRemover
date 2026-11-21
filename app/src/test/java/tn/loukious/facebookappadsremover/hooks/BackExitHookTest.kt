@@ -20,7 +20,22 @@ class BackExitHookTest {
             @JvmStatic fun alsoNot(reason: Thread.State, other: Other) = Unit
 
             @JvmStatic fun returnsSomething(reason: Thread.State, feed: Feed) = 1
+
+            @JvmStatic fun controller(feed: Feed) = Controller()
+
+            @JvmStatic fun count(feed: Feed) = 1
         }
+    }
+
+    /** Shaped like the data controller the fragment hands out. */
+    class Controller {
+        fun load(reason: Thread.State, extra: String) = Unit
+
+        fun began(reason: Thread.State) = Unit
+
+        fun unrelated(extra: String) = Unit
+
+        fun answers(reason: Thread.State) = 1
     }
 
     class Other {
@@ -40,5 +55,14 @@ class BackExitHookTest {
     @Test fun refreshIsTheStaticReasonAndFragmentMethod() {
         val found = Feed::class.java.declaredMethods.filter { BackExitHook.isRefresh(it, Feed::class.java) }
         assertEquals(listOf("refresh"), found.map { it.name })
+    }
+
+    @Test fun controllerRefreshesStartWithTheSameReason() {
+        val feed = Feed::class.java
+        val refreshes = feed.declaredMethods.filter { BackExitHook.isRefresh(it, feed) }
+        val found = BackExitHook.controllerRefreshes(feed, refreshes)
+        assertEquals(listOf("began", "load"), found.map { it.name }.sorted())
+        assertTrue(found.all { it.declaringClass == Controller::class.java })
+        assertTrue(BackExitHook.controllerRefreshes(feed, emptyList()).isEmpty())
     }
 }
