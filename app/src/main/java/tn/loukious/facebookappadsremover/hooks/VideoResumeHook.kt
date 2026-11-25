@@ -340,6 +340,9 @@ object VideoResumeHook {
                     "params=${params != null}, position=${position != null})")
         }
 
+        // Independent of resume: the speed hook shares only the player class.
+        VideoSpeedHook.install(module, cls, start)
+
         L.i(TAG, "video-resume hooks installed on ${cls.name}: $installed method(s) " +
                 "(mod log: '[FacebookVideoResumeHook] - [VideoResume.txt] INIT_OK')")
         return installed > 0

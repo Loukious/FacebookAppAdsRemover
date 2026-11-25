@@ -154,6 +154,10 @@ object Settings {
      *  no-overlay variant changes audible behaviour, so it ships off. */
     const val VIDEO_BACKGROUND = "media.video.background"
 
+    /** Playback speed applied to every video that starts: "off" (Facebook's own,
+     *  the default), or a multiplier such as "1.5" or "2". */
+    const val VIDEO_SPEED = "media.video.speed"
+
     private var prefs: SharedPreferences? = null
 
     /**
