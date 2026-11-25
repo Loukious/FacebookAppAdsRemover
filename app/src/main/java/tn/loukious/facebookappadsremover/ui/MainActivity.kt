@@ -66,6 +66,8 @@ class MainActivity : ComponentActivity(), SettingsModel {
         private set
     override var launcherVisible by mutableStateOf(true)
         private set
+    override var videoSpeed by mutableStateOf("off")
+        private set
     override val contributors: List<Pair<Contributor, ImageBitmap?>> by lazy {
         loadContributors(this).map { c ->
             c to runCatching {
@@ -131,6 +133,7 @@ class MainActivity : ComponentActivity(), SettingsModel {
             values[spec.key] = prefs?.getBoolean(spec.key, spec.default) ?: spec.default
         }
         keywords = prefs?.getString(Settings.FEED_KEYWORDS, "") ?: ""
+        videoSpeed = prefs?.getString(Settings.VIDEO_SPEED, "off") ?: "off"
         frameworkDetail = detail
         moduleState = ModuleState.ACTIVE
         bound = true
@@ -155,6 +158,14 @@ class MainActivity : ComponentActivity(), SettingsModel {
         if (value == keywords) return
         keywords = value
         prefs?.edit()?.putString(Settings.FEED_KEYWORDS, value)?.apply()
+        ui.markChanged()
+    }
+
+    /** Playback speed applied to every video (Settings.VIDEO_SPEED). */
+    override fun updateVideoSpeed(value: String) {
+        if (value == videoSpeed) return
+        videoSpeed = value
+        prefs?.edit()?.putString(Settings.VIDEO_SPEED, value)?.apply()
         ui.markChanged()
     }
 

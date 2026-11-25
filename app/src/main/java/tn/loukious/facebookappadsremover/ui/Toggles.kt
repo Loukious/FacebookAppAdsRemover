@@ -42,7 +42,16 @@ enum class SectionExtra {
      * framework service.
      */
     LAUNCHER,
+
+    /** Playback-speed choice (Settings.VIDEO_SPEED), shown under the section's switches. */
+    SPEED,
 }
+
+/** The speeds on offer: Settings.VIDEO_SPEED value to the label on its chip. */
+val VIDEO_SPEED_CHOICES: List<Pair<String, String>> = listOf(
+    "off" to "Off", "1.25" to "1.25×", "1.5" to "1.5×", "1.75" to "1.75×",
+    "2" to "2×", "2.5" to "2.5×", "3" to "3×",
+)
 
 data class ToggleSection(
     val title: String,
@@ -370,7 +379,7 @@ val TOGGLE_SECTIONS: List<ToggleSection> = listOf(
     ToggleSection("Video", listOf(
         ToggleSpec(Settings.VIDEO_RESUME, "Resume video position", "Continue a video from where you stopped", false),
         ToggleSpec(Settings.VIDEO_BACKGROUND, "Background playback", "The current video keeps playing with the screen off or in another app", false),
-    )),
+    ), SectionExtra.SPEED),
     // No toggles of its own: the export/import buttons are the whole section.
     ToggleSection("Account", emptyList(), SectionExtra.SESSION),
     // Module-local rather than a hook toggle — see SectionExtra.LAUNCHER.

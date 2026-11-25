@@ -13,6 +13,7 @@ import androidx.compose.animation.togetherWith
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.BorderStroke
 import androidx.compose.foundation.Image
+import androidx.compose.foundation.horizontalScroll
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.PaddingValues
@@ -34,12 +35,14 @@ import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.LazyListState
 import androidx.compose.foundation.lazy.rememberLazyListState
+import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material3.AlertDialog
 import androidx.compose.material3.Button
 import androidx.compose.material3.ExperimentalMaterial3Api
 import androidx.compose.material3.ExperimentalMaterial3ExpressiveApi
 import androidx.compose.material3.FilledTonalButton
+import androidx.compose.material3.FilterChip
 import androidx.compose.material3.Icon
 import androidx.compose.material3.IconButton
 import androidx.compose.material3.LargeFlexibleTopAppBar
@@ -81,10 +84,12 @@ interface SettingsModel {
     val changed: Boolean
     val keywords: String
     val launcherVisible: Boolean
+    val videoSpeed: String
     val contributors: List<Pair<Contributor, ImageBitmap?>>
     fun isOn(spec: ToggleSpec): Boolean
     fun setOn(spec: ToggleSpec, on: Boolean)
     fun updateKeywords(value: String)
+    fun updateVideoSpeed(value: String)
     fun updateLauncherVisible(visible: Boolean)
     fun restartFacebook()
     fun sessionExport()
@@ -248,11 +253,13 @@ private fun summaryFor(model: SettingsModel, section: ToggleSection): String {
         SectionExtra.LAUNCHER -> if (model.launcherVisible) "Launcher icon shown" else "Launcher icon hidden"
         else -> ""
     }
-    val on = section.toggles.count { model.isOn(it) }
+    val speed = if (section.extra == SectionExtra.SPEED) 1 else 0
+    val on = section.toggles.count { model.isOn(it) } +
+        if (speed == 1 && model.videoSpeed != "off") 1 else 0
     return when {
         on == 0 -> "Off"
-        section.toggles.size == 1 -> "On"
-        else -> "$on of ${section.toggles.size} on"
+        section.toggles.size + speed == 1 -> "On"
+        else -> "$on of ${section.toggles.size + speed} on"
     }
 }
 
@@ -377,6 +384,31 @@ private fun SectionScreen(model: SettingsModel, title: String, back: () -> Unit)
                         "Hide this app from the app drawer. You can still open it from LSPosed or Vector",
                         checked = model.launcherVisible, enabled = true,
                     ) { if (it) model.updateLauncherVisible(true) else confirmHide = true }
+                }
+                SectionExtra.SPEED -> rows += { shape ->
+                    ContentRow(shape) {
+                        Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
+                            Text("Video speed", style = MaterialTheme.typography.bodyLarge)
+                            Text(
+                                "Every video starts at this speed instead of 1×. Off leaves Facebook's own speed menu in charge",
+                                style = MaterialTheme.typography.bodyMedium,
+                                color = MaterialTheme.colorScheme.onSurfaceVariant,
+                            )
+                            Row(
+                                modifier = Modifier.horizontalScroll(rememberScrollState()),
+                                horizontalArrangement = Arrangement.spacedBy(8.dp),
+                            ) {
+                                for ((value, label) in VIDEO_SPEED_CHOICES) {
+                                    FilterChip(
+                                        selected = model.videoSpeed == value,
+                                        onClick = { model.updateVideoSpeed(value) },
+                                        enabled = model.bound,
+                                        label = { Text(label) },
+                                    )
+                                }
+                            }
+                        }
+                    }
                 }
                 SectionExtra.NONE -> {}
             }
